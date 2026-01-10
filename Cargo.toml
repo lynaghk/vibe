@@ -1,0 +1,11 @@
+[package]
+name = "vibebox"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+objc2 = "*"
+objc2-foundation = { version = "*", features = ["NSArray", "NSString", "NSURL", "NSError", "NSFileHandle"] }
+objc2-virtualization = "*"
+block2 = "*"
+dispatch2 = "*"
