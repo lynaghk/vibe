@@ -1,11 +1,11 @@
-use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::{fs, io::Write};
 
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::AnyThread;
-use objc2_foundation::{NSArray, NSError, NSString, NSURL};
+use objc2_foundation::{NSArray, NSError, NSString, NSURL, NSUInteger};
 use objc2_virtualization::{
     VZDiskImageCachingMode, VZDiskImageStorageDeviceAttachment, VZDiskImageSynchronizationMode,
     VZFileHandleSerialPortAttachment, VZLinuxBootLoader, VZNATNetworkDeviceAttachment,
@@ -142,41 +142,32 @@ fn create_vm_configuration(
     println!("[DEBUG] Starting VM configuration creation...");
     unsafe {
         let config = VZVirtualMachineConfiguration::new();
-        println!("[DEBUG] Created VZVirtualMachineConfiguration");
-
         config.setCPUCount(2);
         config.setMemorySize(4 * 1024 * 1024 * 1024);
-        println!("[DEBUG] Set CPU count: 2, Memory: 4GB");
 
         let kernel_path_abs = std::fs::canonicalize(KERNEL_PATH)?;
-        println!("[DEBUG] Kernel absolute path: {:?}", kernel_path_abs);
         let kernel_url =
             NSURL::fileURLWithPath(&NSString::from_str(kernel_path_abs.to_str().unwrap()));
-        println!("[DEBUG] Created kernel URL");
 
         let boot_loader =
             VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &kernel_url);
-        println!("[DEBUG] Created boot loader");
 
         let initrd_path_abs = std::fs::canonicalize(INITRD_PATH)?;
-        println!("[DEBUG] Initrd absolute path: {:?}", initrd_path_abs);
         let initrd_url =
             NSURL::fileURLWithPath(&NSString::from_str(initrd_path_abs.to_str().unwrap()));
         boot_loader.setInitialRamdiskURL(Some(&initrd_url));
-        println!("[DEBUG] Set initial ramdisk");
 
-        let cmdline =
-            NSString::from_str("console=hvc0 root=/dev/vda1 rw earlyprintk=serial");
+        //let cmdline = NSString::from_str("console=hvc0 root=/dev/vda1 rw earlyprintk=serial");
+        let cmdline = NSString::from_str("console=hvc0 root=/dev/vda1 rw earlycon");
 
         boot_loader.setCommandLine(&cmdline);
 
         config.setBootLoader(Some(&boot_loader));
-        println!("[DEBUG] Set boot loader on config");
 
         let disk_path_abs = std::fs::canonicalize(DISK_PATH)?;
-        println!("[DEBUG] Disk absolute path: {:?}", disk_path_abs);
+
         let disk_url = NSURL::fileURLWithPath(&NSString::from_str(disk_path_abs.to_str().unwrap()));
-        println!("[DEBUG] Creating disk attachment...");
+
         let disk_attachment = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_cachingMode_synchronizationMode_error(
             VZDiskImageStorageDeviceAttachment::alloc(),
             &disk_url,
@@ -184,19 +175,17 @@ fn create_vm_configuration(
             VZDiskImageCachingMode::Automatic,
             VZDiskImageSynchronizationMode::Full
         )?;
-        println!("[DEBUG] Created disk attachment");
 
         let disk_device = VZVirtioBlockDeviceConfiguration::initWithAttachment(
             VZVirtioBlockDeviceConfiguration::alloc(),
             &disk_attachment,
         );
-        println!("[DEBUG] Created disk device configuration");
 
         let cloudinit_path_abs = std::fs::canonicalize(CLOUDINIT_PATH)?;
-        println!("[DEBUG] Cloud-init absolute path: {:?}", cloudinit_path_abs);
+
         let cloudinit_url =
             NSURL::fileURLWithPath(&NSString::from_str(cloudinit_path_abs.to_str().unwrap()));
-        println!("[DEBUG] Creating cloud-init attachment...");
+
         let cloudinit_attachment = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_cachingMode_synchronizationMode_error(
             VZDiskImageStorageDeviceAttachment::alloc(),
             &cloudinit_url,
@@ -204,20 +193,17 @@ fn create_vm_configuration(
             VZDiskImageCachingMode::Automatic,
             VZDiskImageSynchronizationMode::Full
         )?;
-        println!("[DEBUG] Created cloud-init attachment");
 
         let cloudinit_device = VZVirtioBlockDeviceConfiguration::initWithAttachment(
             VZVirtioBlockDeviceConfiguration::alloc(),
             &cloudinit_attachment,
         );
-        println!("[DEBUG] Created cloud-init device configuration");
 
         let storage_devices: Retained<NSArray<_>> = NSArray::from_retained_slice(&[
             Retained::into_super(disk_device),
             Retained::into_super(cloudinit_device),
         ]);
         config.setStorageDevices(&storage_devices);
-        println!("[DEBUG] Set storage devices");
 
         let nat_attachment = VZNATNetworkDeviceAttachment::new();
         let network_device = VZVirtioNetworkDeviceConfiguration::new();
@@ -226,17 +212,14 @@ fn create_vm_configuration(
         let network_devices: Retained<NSArray<_>> =
             NSArray::from_retained_slice(&[Retained::into_super(network_device)]);
         config.setNetworkDevices(&network_devices);
-        println!("[DEBUG] Set network devices");
 
         let entropy_device = VZVirtioEntropyDeviceConfiguration::new();
         let entropy_devices: Retained<NSArray<_>> =
             NSArray::from_retained_slice(&[Retained::into_super(entropy_device)]);
         config.setEntropyDevices(&entropy_devices);
-        println!("[DEBUG] Set entropy devices");
 
         let stdin_handle = objc2_foundation::NSFileHandle::fileHandleWithStandardInput();
         let stdout_handle = objc2_foundation::NSFileHandle::fileHandleWithStandardOutput();
-        println!("[DEBUG] Got file handles for stdin/stdout");
 
         let serial_attachment =
             VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
@@ -244,20 +227,19 @@ fn create_vm_configuration(
                 Some(&stdin_handle),
                 Some(&stdout_handle),
             );
-        println!("[DEBUG] Created serial attachment");
+
+        let console_device = VZVirtioConsoleDeviceConfiguration::new();
+        let console_ports = console_device.ports();
 
         let console_port = VZVirtioConsolePortConfiguration::new();
         console_port.setAttachment(Some(&serial_attachment));
+        console_port.setIsConsole(true);
 
-        let console_device = VZVirtioConsoleDeviceConfiguration::new();
-        let ports_array = console_device.ports();
-        ports_array.setObject_atIndexedSubscript(Some(&console_port), 0);
-        println!("[DEBUG] Created console device");
+        console_ports.setObject_atIndexedSubscript(Some(&console_port), 0 as NSUInteger);
 
         let console_devices: Retained<NSArray<_>> =
             NSArray::from_retained_slice(&[Retained::into_super(console_device)]);
         config.setConsoleDevices(&console_devices);
-        println!("[DEBUG] Set console devices");
 
         println!("[DEBUG] Validating configuration...");
         let valid = config.validateWithError();
@@ -379,8 +361,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Console output should appear below:");
     println!("---");
 
+    set_raw_mode(std::io::stdin().as_raw_fd());
+
+    // Flush stdout to ensure messages appear
+    std::io::stdout().flush().ok();
+
+    // Need to keep pumping the run loop to process console I/O
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        let result = unsafe {
+            objc2_foundation::NSRunLoop::mainRunLoop().runMode_beforeDate(
+                objc2_foundation::NSDefaultRunLoopMode,
+                &objc2_foundation::NSDate::dateWithTimeIntervalSinceNow(0.1),
+            )
+        };
 
         let state = unsafe { vm.state() };
         if state != objc2_virtualization::VZVirtualMachineState::Running {
@@ -390,4 +383,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+use std::io;
+use std::os::unix::io::AsRawFd;
+
+fn set_raw_mode(fd: i32) -> io::Result<libc::termios> {
+    let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+
+    if unsafe { libc::tcgetattr(fd, &mut attributes) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let original = attributes;
+
+    attributes.c_iflag &= !(libc::ICRNL as libc::tcflag_t);
+    attributes.c_lflag &= !((libc::ICANON | libc::ECHO) as libc::tcflag_t);
+
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &attributes) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(original)
 }

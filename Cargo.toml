@@ -9,3 +9,4 @@ objc2-foundation = { version = "*", features = ["NSArray", "NSString", "NSURL", 
 objc2-virtualization = "*"
 block2 = "*"
 dispatch2 = "*"
+libc = "*"
