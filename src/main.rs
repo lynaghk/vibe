@@ -20,9 +20,8 @@ use objc2_foundation::{
 };
 use objc2_virtualization::{
     VZDiskImageCachingMode, VZDiskImageStorageDeviceAttachment, VZDiskImageSynchronizationMode,
-    VZEFIBootLoader, VZEFIVariableStore, VZEFIVariableStoreInitializationOptions,
     VZFileHandleSerialPortAttachment, VZGenericMachineIdentifier, VZGenericPlatformConfiguration,
-    VZNATNetworkDeviceAttachment, VZSharedDirectory, VZSingleDirectoryShare,
+    VZLinuxBootLoader, VZNATNetworkDeviceAttachment, VZSharedDirectory, VZSingleDirectoryShare,
     VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceConfiguration,
     VZVirtioConsolePortConfiguration, VZVirtioEntropyDeviceConfiguration,
     VZVirtioFileSystemDeviceConfiguration, VZVirtioNetworkDeviceConfiguration, VZVirtualMachine,
@@ -36,6 +35,10 @@ const CPU_COUNT: usize = 4;
 const RAM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const CLOUD_INIT_ISO: &str = "cloud-init.iso";
 const CLOUD_INIT_LABEL: &str = "cidata";
+const KERNEL_URL: &str = "https://deb.debian.org/debian/dists/bookworm/main/installer-arm64/current/images/netboot/debian-installer/arm64/linux";
+const INITRD_URL: &str = "https://deb.debian.org/debian/dists/bookworm/main/installer-arm64/current/images/netboot/debian-installer/arm64/initrd.gz";
+const KERNEL_NAME: &str = "vmlinux-debian";
+const INITRD_NAME: &str = "initrd-debian";
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 const VIRTIOFS_MOUNT_SERVICE: &str = "vibebox-mounts.service";
 
@@ -75,7 +78,8 @@ struct VmPaths {
     instance_disk: PathBuf,
     cloud_init_iso: PathBuf,
     machine_identifier: PathBuf,
-    efi_vars: PathBuf,
+    kernel_path: PathBuf,
+    initrd_path: PathBuf,
     cargo_registry: PathBuf,
 }
 
@@ -102,7 +106,8 @@ impl VmPaths {
         let instance_disk = instance_dir.join("instance.raw");
         let cloud_init_iso = instance_dir.join(CLOUD_INIT_ISO);
         let machine_identifier = instance_dir.join("machine.id");
-        let efi_vars = instance_dir.join("efi_vars.bin");
+        let kernel_path = cache_dir.join(KERNEL_NAME);
+        let initrd_path = cache_dir.join(INITRD_NAME);
         let cargo_registry = home.join(".cargo/registry");
 
         Ok(Self {
@@ -116,7 +121,8 @@ impl VmPaths {
             instance_disk,
             cloud_init_iso,
             machine_identifier,
-            efi_vars,
+            kernel_path,
+            initrd_path,
             cargo_registry,
         })
     }
@@ -130,6 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     convert_to_raw(&paths)?;
     ensure_instance_disk(&paths)?;
     create_cloud_init_iso(&paths)?;
+    download_kernel_and_initrd(&paths)?;
 
     let config = create_vm_configuration(&paths)?;
     run_vm(config)
@@ -255,6 +262,49 @@ fn create_cloud_init_iso(paths: &VmPaths) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+fn download_kernel_and_initrd(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
+    if paths.kernel_path.exists() && paths.initrd_path.exists() {
+        println!(
+            "Reusing cached kernel/initrd at {} and {}",
+            paths.kernel_path.display(),
+            paths.initrd_path.display()
+        );
+        return Ok(());
+    }
+
+    println!("Downloading netboot kernel...");
+    let status = Command::new("curl")
+        .args([
+            "-L",
+            KERNEL_URL,
+            "-o",
+            paths.kernel_path.to_string_lossy().as_ref(),
+        ])
+        .status()?;
+    if !status.success() {
+        return Err("Failed to download kernel".into());
+    }
+
+    let initrd_gz = paths.initrd_path.with_extension("gz");
+    println!("Downloading netboot initrd.gz...");
+    let status = Command::new("curl")
+        .args(["-L", INITRD_URL, "-o", initrd_gz.to_string_lossy().as_ref()])
+        .status()?;
+    if !status.success() {
+        return Err("Failed to download initrd.gz".into());
+    }
+
+    println!("Decompressing initrd...");
+    let status = Command::new("gunzip")
+        .args(["-f", initrd_gz.to_string_lossy().as_ref()])
+        .status()?;
+    if !status.success() {
+        return Err("Failed to decompress initrd".into());
+    }
+
+    Ok(())
+}
+
 fn cloud_init_user_data(project_name: &str) -> String {
     format!(
         r#"#cloud-config
@@ -326,9 +376,13 @@ fn create_vm_configuration(
         let machine_id = load_machine_identifier(paths)?;
         platform.setMachineIdentifier(&machine_id);
 
-        let boot_loader = VZEFIBootLoader::init(VZEFIBootLoader::alloc());
-        let variable_store = load_variable_store(paths)?;
-        boot_loader.setVariableStore(Some(&variable_store));
+        let kernel_url = nsurl_from_path(&paths.kernel_path)?;
+        let boot_loader =
+            VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &kernel_url);
+        let initrd_url = nsurl_from_path(&paths.initrd_path)?;
+        boot_loader.setInitialRamdiskURL(Some(&initrd_url));
+        let cmdline = NSString::from_str("console=hvc0 root=LABEL=cloudimg-rootfs rw");
+        boot_loader.setCommandLine(&cmdline);
 
         let config = VZVirtualMachineConfiguration::new();
         config.setPlatform(&platform);
@@ -437,28 +491,6 @@ fn load_machine_identifier(
             return Err("Failed to persist machine identifier".into());
         }
         Ok(id)
-    }
-}
-
-fn load_variable_store(
-    paths: &VmPaths,
-) -> Result<Retained<VZEFIVariableStore>, Box<dyn std::error::Error>> {
-    unsafe {
-        if paths.efi_vars.exists() {
-            let url = nsurl_from_path(&paths.efi_vars)?;
-            return Ok(VZEFIVariableStore::initWithURL(
-                VZEFIVariableStore::alloc(),
-                &url,
-            ));
-        }
-
-        let url = nsurl_from_path(&paths.efi_vars)?;
-        let store = VZEFIVariableStore::initCreatingVariableStoreAtURL_options_error(
-            VZEFIVariableStore::alloc(),
-            &url,
-            VZEFIVariableStoreInitializationOptions::AllowOverwrite,
-        )?;
-        Ok(store)
     }
 }
 
