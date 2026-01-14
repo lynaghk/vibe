@@ -13,7 +13,7 @@ use dispatch2::DispatchQueue;
 use objc2::define_class;
 use objc2::rc::Retained;
 use objc2::runtime::{NSObject, ProtocolObject};
-use objc2::{msg_send, AnyThread};
+use objc2::{AnyThread, msg_send};
 use objc2_foundation::{
     NSArray, NSData, NSDate, NSDefaultRunLoopMode, NSError, NSFileHandle, NSObjectProtocol,
     NSRunLoop, NSString, NSUInteger, NSURL,
@@ -46,12 +46,12 @@ define_class!(
 
     impl VmDelegate {
         #[unsafe(method(guestDidStopVirtualMachine:))]
-        fn guest_did_stop_virtual_machine(&self, _vm: &VZVirtualMachine) {
+        unsafe fn guest_did_stop_virtual_machine(&self, _vm: &VZVirtualMachine) {
             println!("[delegate] guest stopped the VM");
         }
 
         #[unsafe(method(virtualMachine:didStopWithError:))]
-        fn vm_did_stop_with_error(&self, _vm: &VZVirtualMachine, error: &NSError) {
+        unsafe fn vm_did_stop_with_error(&self, _vm: &VZVirtualMachine, error: &NSError) {
             println!(
                 "[delegate] VM stopped with error: {:?}",
                 error.localizedDescription()
@@ -528,6 +528,13 @@ fn run_vm(
         vm.setDelegate(Some(&delegate));
     }
 
+    let initial_state = unsafe { vm.state() };
+    println!(
+        "[start] canStart={} initial_state={:?}",
+        unsafe { vm.canStart() },
+        initial_state
+    );
+
     let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
 
     let completion_handler = RcBlock::new(move |error: *mut NSError| {
@@ -572,6 +579,7 @@ fn run_vm(
     println!("VM started. Console attached to STDIN/STDOUT.");
     let raw_guard = enable_raw_mode(io::stdin().as_raw_fd())?;
 
+    let mut last_state = None;
     loop {
         unsafe {
             NSRunLoop::mainRunLoop().runMode_beforeDate(
@@ -581,6 +589,10 @@ fn run_vm(
         };
 
         let state = unsafe { vm.state() };
+        if last_state != Some(state) {
+            println!("[state] {:?}", state);
+            last_state = Some(state);
+        }
         if state != objc2_virtualization::VZVirtualMachineState::Running {
             println!("VM stopped with state: {:?}", state);
             break;
