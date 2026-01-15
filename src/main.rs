@@ -27,11 +27,10 @@ use objc2_virtualization::{
     VZVirtioNetworkDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
 };
 
-const DEBIAN_ORIGIN: &str = "debian-13-nocloud-arm64";
 const DEBIAN_DISK_URL: &str =
-    "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-nocloud-arm64.qcow2";
+    "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2";
 const PROVISION_SCRIPT: &str = include_str!("../provisioning/provision.sh");
-const VIRTIOFS_MOUNT_SERVICE: &str = "vibebox-mounts.service";
+
 const DISK_SIZE_GB: u64 = 10;
 const CPU_COUNT: usize = 4;
 const RAM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -48,6 +47,7 @@ struct VmPaths {
     base_raw: PathBuf,
     configured_base: PathBuf,
     instance_disk: PathBuf,
+    cloud_init_iso: PathBuf,
     machine_identifier: PathBuf,
     efi_variable_store: PathBuf,
     cargo_registry: PathBuf,
@@ -75,6 +75,7 @@ impl VmPaths {
         let base_raw = cache_dir.join("base.raw");
         let configured_base = cache_dir.join("configured_base.raw");
         let instance_disk = instance_dir.join("instance.raw");
+        let cloud_init_iso = cache_dir.join("cloud-init.iso");
         let machine_identifier = instance_dir.join("machine.id");
         let efi_variable_store = instance_dir.join("efi-variable-store");
         let cargo_registry = home.join(".cargo/registry");
@@ -90,6 +91,7 @@ impl VmPaths {
             base_raw,
             configured_base,
             instance_disk,
+            cloud_init_iso,
             machine_identifier,
             efi_variable_store,
             cargo_registry,
@@ -105,7 +107,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     create_console_log(&paths)?;
     download_base_image(&paths)?;
     convert_to_raw(&paths)?;
+    //TODO: only create this iso when configuring the base, not every run.
+    create_cloud_init_iso(&paths)?;
     ensure_configured_base(&paths)?;
+
     let provision_needed = ensure_instance_disk(&paths)?;
 
     let config = create_vm_configuration(&paths, &paths.instance_disk)?;
@@ -219,6 +224,67 @@ fn ensure_configured_base(paths: &VmPaths) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+fn create_cloud_init_iso(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Building cloud-init ISO...");
+    let data_dir = paths.cache_dir.join("cloud-init-data");
+    if data_dir.exists() {
+        fs::remove_dir_all(&data_dir)?;
+    }
+    fs::create_dir_all(&data_dir)?;
+
+    let meta_data = format!(
+        "instance-id: {}\nlocal-hostname: {}\n",
+        paths.project_name, paths.project_name
+    );
+
+    let user_data = cloud_init_user_data();
+
+    fs::write(data_dir.join("meta-data"), meta_data)?;
+    fs::write(data_dir.join("user-data"), user_data)?;
+
+    if paths.cloud_init_iso.exists() {
+        fs::remove_file(&paths.cloud_init_iso)?;
+    }
+
+    let status = Command::new("hdiutil")
+        .args([
+            "makehybrid",
+            "-o",
+            paths.cloud_init_iso.to_string_lossy().as_ref(),
+            "-iso",
+            "-joliet",
+            "-default-volume-name",
+            "cidata",
+            data_dir.to_string_lossy().as_ref(),
+        ])
+        .status()?;
+
+    fs::remove_dir_all(&data_dir)?;
+
+    if !status.success() {
+        return Err("Failed to build cloud-init ISO".into());
+    }
+
+    Ok(())
+}
+
+fn cloud_init_user_data() -> String {
+    format!(
+        r#"#cloud-config
+users:
+  - name: user
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: false
+ssh_pwauth: true
+runcmd:
+  - sed -i 's/^#PermitEmptyPasswords.*/PermitEmptyPasswords yes/' /etc/ssh/sshd_config
+  - passwd -d user
+  - systemctl restart sshd
+"#,
+    )
+}
+
 fn ensure_instance_disk(paths: &VmPaths) -> Result<bool, Box<dyn std::error::Error>> {
     if paths.instance_disk.exists() {
         if validate_image(&paths.instance_disk, "instance raw") {
@@ -282,8 +348,17 @@ fn create_vm_configuration(
             &disk_attachment,
         );
 
-        let storage_devices: Retained<NSArray<_>> =
-            NSArray::from_retained_slice(&[Retained::into_super(disk_device)]);
+        let cloud_init_attachment = create_disk_attachment(&paths.cloud_init_iso, true)?;
+        let cloud_init_device = VZVirtioBlockDeviceConfiguration::initWithAttachment(
+            VZVirtioBlockDeviceConfiguration::alloc(),
+            &cloud_init_attachment,
+        );
+
+        let storage_devices: Retained<NSArray<_>> = NSArray::from_retained_slice(&[
+            Retained::into_super(disk_device),
+            Retained::into_super(cloud_init_device),
+        ]);
+
         config.setStorageDevices(&storage_devices);
 
         let nat_attachment = VZNATNetworkDeviceAttachment::new();
@@ -408,36 +483,34 @@ fn start_script_thread(
         }
         eprintln!("provisioning...");
 
-        // Duplicate the write fd so we don't close the one held by the serial port.
-        unsafe {
-            let dup_fd = libc::dup(inject_fd);
-            if dup_fd < 0 {
-                eprintln!("Failed to dup inject fd: {}", io::Error::last_os_error());
-                return;
-            }
-            let mut stdin = File::from_raw_fd(dup_fd);
+        //  // Duplicate the write fd so we don't close the one held by the serial port.
+        //  unsafe {
+        //      let dup_fd = libc::dup(inject_fd);
+        //      if dup_fd < 0 {
+        //          eprintln!("Failed to dup inject fd: {}", io::Error::last_os_error());
+        //          return;
+        //      }
+        //      let mut stdin = File::from_raw_fd(dup_fd);
 
-            let mut do_write = |payload: &str| {
-                if let Err(e) = stdin.write_all(payload.as_bytes()) {
-                    eprintln!("Failed to write payload to VM serial: {}", e);
-                }
-                let _ = stdin.flush();
-            };
+        //      let mut do_write = |payload: &str| {
+        //          if let Err(e) = stdin.write_all(payload.as_bytes()) {
+        //              eprintln!("Failed to write payload to VM serial: {}", e);
+        //          }
+        //          let _ = stdin.flush();
+        //      };
 
-            do_write("root\n");
-            std::thread::sleep(Duration::from_millis(500));
+        //      do_write("root\n");
+        //      std::thread::sleep(Duration::from_millis(500));
 
-            do_write( &format!(
-           "root\ncat >/root/provision.sh <<'EOF'\n{script}EOF\nchmod +x /root/provision.sh\n/root/provision.sh\n",
-       ));
-        }
+        //      do_write( &format!(
+        //     "root\ncat >/root/provision.sh <<'EOF'\n{script}EOF\nchmod +x /root/provision.sh\n/root/provision.sh\n",
+        // ));
+        //  }
     })
 }
 
 fn format_provision_script(project_name: &str) -> String {
-    PROVISION_SCRIPT
-        .replace("{project_name}", project_name)
-        .replace("{mount_service}", VIRTIOFS_MOUNT_SERVICE)
+    PROVISION_SCRIPT.replace("{project_name}", project_name)
 }
 
 fn wait_for_login(log_path: &Path) -> bool {
@@ -920,48 +993,7 @@ impl Drop for RawModeGuard {
 
 // With this, type `~.` on a new line to disconnect from the console. Ctrl-C goes to guest.
 
-// should this provisioned vm have access to the internet? ping seems to hang without even timing out
-
-// Yes, it should. The VM is configured with `VZNATNetworkDeviceAttachment` which provides NAT networking through the host.
-
-// The hang without timeout suggests the network interface isn't coming up properly in the guest. Likely causes:
-
-// 1. **Missing network interface configuration** - Debian cloud images often expect cloud-init or DHCP to configure the interface, but with `nocloud` variant there's no cloud-init running.
-
-// 2. **Interface not brought up** - The virtio-net device is probably present but not configured.
-
-// Check inside the guest:
-
-// ```
-// ip link
-// ip addr
-// ```
-
-// You'll likely see an interface (probably `enp0s1` or similar) that's DOWN or has no IP.
-
-// Fix in your provision script - add early network setup:
-
-// ```
-// # Bring up network interface with DHCP
-// for iface in /sys/class/net/en*; do
-//     iface_name=$(basename "$iface")
-//     ip link set "$iface_name" up
-//     dhclient "$iface_name" || dhcpcd "$iface_name" || true
-// done
-// ```
-
-// Or more robustly, check if the image has `systemd-networkd`. You may need to create `/etc/systemd/network/80-dhcp.network`:
-
-// ```
-// [Match]
-// Name=en*
-
-// [Network]
-// DHCP=yes
-// ```
-
-// Then `systemctl enable --now systemd-networkd`.
-
-// The NAT attachment itself is fine - it's the guest-side configuration that's missing.
-
-// I don't have dhclient or dhcpcd!
+// mkdir -p .local/share/mise
+// sudo mount -t virtiofs mise_cache .local/share/mise
+// curl https://mise.run | sh
+// echo 'eval "$(~/.local/bin/mise activate bash)"' >> ~/.bashrc
