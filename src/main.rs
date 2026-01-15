@@ -1,9 +1,9 @@
 use std::env;
 use std::ffi::CString;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -301,7 +301,13 @@ fn create_console_log(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>>
 fn create_vm_configuration(
     paths: &VmPaths,
     disk_path: &Path,
-) -> Result<Retained<VZVirtualMachineConfiguration>, Box<dyn std::error::Error>> {
+) -> Result<
+    (
+        Retained<VZVirtualMachineConfiguration>,
+        Option<thread::JoinHandle<()>>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     unsafe {
         let platform =
             VZGenericPlatformConfiguration::init(VZGenericPlatformConfiguration::alloc());
@@ -356,39 +362,19 @@ fn create_vm_configuration(
         config.setDirectorySharingDevices(&share_devices);
 
         let stdin_handle = NSFileHandle::fileHandleWithStandardInput();
-        let stdout_handle = NSFileHandle::fileHandleWithStandardOutput();
-        let log_ns_path = NSString::from_str(
-            paths
-                .console_log
-                .to_str()
-                .ok_or("Non-UTF8 console log path")?,
-        );
-        let log_handle = NSFileHandle::fileHandleForWritingAtPath(&log_ns_path)
-            .ok_or("Failed to open console log file handle")?;
+        let (console_write_handle, tee_thread) = tee_console_to_log(&paths.console_log)?;
 
-        // First virtio console goes to the interactive terminal; second mirrors to a log file.
-        let serial_attachment_stdout =
+        let serial_attachment =
             VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
                 VZFileHandleSerialPortAttachment::alloc(),
                 Some(&stdin_handle),
-                Some(&stdout_handle),
+                Some(&console_write_handle),
             );
-        let serial_console_stdout = VZVirtioConsoleDeviceSerialPortConfiguration::new();
-        serial_console_stdout.setAttachment(Some(&serial_attachment_stdout));
+        let serial_console = VZVirtioConsoleDeviceSerialPortConfiguration::new();
+        serial_console.setAttachment(Some(&serial_attachment));
 
-        let serial_attachment_log =
-            VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
-                VZFileHandleSerialPortAttachment::alloc(),
-                None,
-                Some(&log_handle),
-            );
-        let serial_console_log = VZVirtioConsoleDeviceSerialPortConfiguration::new();
-        serial_console_log.setAttachment(Some(&serial_attachment_log));
-
-        let serial_ports: Retained<NSArray<_>> = NSArray::from_retained_slice(&[
-            Retained::into_super(serial_console_stdout),
-            Retained::into_super(serial_console_log),
-        ]);
+        let serial_ports: Retained<NSArray<_>> =
+            NSArray::from_retained_slice(&[Retained::into_super(serial_console)]);
         config.setSerialPorts(&serial_ports);
 
         config.validateWithError().map_err(|e| {
@@ -398,7 +384,7 @@ fn create_vm_configuration(
             )
         })?;
 
-        Ok(config)
+        Ok((config, tee_thread))
     }
 }
 
@@ -454,10 +440,13 @@ fn load_efi_variable_store(
     }
 }
 
-fn start_script_thread(script: String) -> thread::JoinHandle<()> {
+fn start_script_thread(script: String, log_path: PathBuf) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        // Wait for getty to appear, then log in and run the script.
-        thread::sleep(Duration::from_secs(8));
+        // Wait for getty/login prompt to appear, then log in and run the script.
+        if !wait_for_login(&log_path) {
+            eprintln!("Timed out waiting for login prompt; skipping injected script");
+            return;
+        }
         if let Ok(mut stdin) = std::fs::OpenOptions::new()
             .write(true)
             .open("/dev/stdin")
@@ -478,6 +467,19 @@ fn format_provision_script(project_name: &str) -> String {
         .replace("{mount_service}", VIRTIOFS_MOUNT_SERVICE)
 }
 
+fn wait_for_login(log_path: &Path) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while Instant::now() < deadline {
+        if let Ok(contents) = fs::read_to_string(log_path) {
+            if contents.contains("login:") {
+                return true;
+            }
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    false
+}
+
 fn format_mount_script(paths: &VmPaths) -> String {
     format!(
         r#"root
@@ -490,6 +492,49 @@ exit
 "#,
         project = paths.project_name
     )
+}
+
+fn tee_console_to_log(
+    log_path: &Path,
+) -> Result<(Retained<NSFileHandle>, Option<thread::JoinHandle<()>>), Box<dyn std::error::Error>>
+{
+    let mut fds = [0; 2];
+    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let read_fd = fds[0];
+    let write_fd = fds[1];
+
+    let handle = NSFileHandle::alloc();
+    let ns_write_handle =
+        NSFileHandle::initWithFileDescriptor_closeOnDealloc(handle, write_fd, true);
+
+    let log_path = log_path.to_path_buf();
+    let tee_thread = thread::spawn(move || {
+        let mut reader = unsafe { File::from_raw_fd(read_fd) };
+        let mut stdout = io::stdout();
+        let mut log = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&log_path)
+            .ok();
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            let _ = stdout.write_all(&buf[..n]);
+            let _ = stdout.flush();
+            if let Some(file) = log.as_mut() {
+                let _ = file.write_all(&buf[..n]);
+                let _ = file.flush();
+            }
+        }
+    });
+
+    Ok((ns_write_handle, Some(tee_thread)))
 }
 
 fn create_disk_attachment(
@@ -546,7 +591,7 @@ enum MountMode {
 }
 
 fn run_vm(
-    config: Retained<VZVirtualMachineConfiguration>,
+    config: (Retained<VZVirtualMachineConfiguration>, Option<thread::JoinHandle<()>>),
     provision: bool,
     paths: &VmPaths,
     mount_mode: MountMode,
@@ -554,6 +599,7 @@ fn run_vm(
     println!("Starting VM with Apple Virtualization Framework...");
 
     let queue = DispatchQueue::main();
+    let (config, tee_handle) = config;
     let vm = unsafe {
         VZVirtualMachine::initWithConfiguration_queue(VZVirtualMachine::alloc(), &config, &queue)
     };
@@ -591,14 +637,17 @@ fn run_vm(
 
     let provision_thread = if provision && !paths.configured_marker.exists() {
         let script = format_provision_script(&paths.project_name);
-        Some(start_script_thread(script))
+        Some(start_script_thread(script, paths.console_log.clone()))
     } else {
         None
     };
 
     let mount_thread = match mount_mode {
         MountMode::SkipMounts => None,
-        MountMode::MountAndChown => Some(start_script_thread(format_mount_script(paths))),
+        MountMode::MountAndChown => Some(start_script_thread(
+            format_mount_script(paths),
+            paths.console_log.clone(),
+        )),
     };
 
     let start_deadline = Instant::now() + START_TIMEOUT;
@@ -655,6 +704,9 @@ fn run_vm(
         fs::write(&paths.configured_marker, "ok")?;
     }
     if let Some(handle) = mount_thread {
+        let _ = handle.join();
+    }
+    if let Some(handle) = tee_handle {
         let _ = handle.join();
     }
     Ok(())
