@@ -1,11 +1,12 @@
 use std::env;
 use std::ffi::CString;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
@@ -22,8 +23,9 @@ use objc2_virtualization::{
     VZDiskImageCachingMode, VZDiskImageStorageDeviceAttachment, VZDiskImageSynchronizationMode,
     VZEFIBootLoader, VZEFIVariableStore, VZEFIVariableStoreInitializationOptions,
     VZFileHandleSerialPortAttachment, VZGenericMachineIdentifier, VZGenericPlatformConfiguration,
-    VZNATNetworkDeviceAttachment, VZVirtioBlockDeviceConfiguration,
-    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioEntropyDeviceConfiguration,
+    VZNATNetworkDeviceAttachment, VZSharedDirectory, VZSingleDirectoryShare,
+    VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
+    VZVirtioEntropyDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration,
     VZVirtioNetworkDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration,
     VZVirtualMachineDelegate,
 };
@@ -31,6 +33,8 @@ use objc2_virtualization::{
 const DEBIAN_ORIGIN: &str = "debian-13-nocloud-arm64";
 const DEBIAN_DISK_URL: &str =
     "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-nocloud-arm64.qcow2";
+const PROVISION_SCRIPT: &str = include_str!("../provisioning/provision.sh");
+const VIRTIOFS_MOUNT_SERVICE: &str = "vibebox-mounts.service";
 const DISK_SIZE_GB: u64 = 10;
 const CPU_COUNT: usize = 4;
 const RAM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -65,14 +69,18 @@ struct VmPaths {
     project_root: PathBuf,
     project_name: String,
     cache_dir: PathBuf,
+    guest_mise_cache: PathBuf,
     instance_dir: PathBuf,
     downloaded_image: PathBuf,
     base_raw: PathBuf,
+    configured_base: PathBuf,
     instance_disk: PathBuf,
     machine_identifier: PathBuf,
     efi_variable_store: PathBuf,
+    cargo_registry: PathBuf,
     console_log: PathBuf,
     origin_marker: PathBuf,
+    configured_marker: PathBuf,
 }
 
 impl VmPaths {
@@ -89,28 +97,36 @@ impl VmPaths {
             .map(PathBuf::from)
             .unwrap_or_else(|_| home.join(".cache"));
         let cache_dir = cache_home.join("vibetron");
+        let guest_mise_cache = cache_dir.join(".guest-mise-cache");
         let instance_dir = project_root.join(".vibetron");
 
         let downloaded_image = cache_dir.join("downloaded.qcow2");
         let base_raw = cache_dir.join("base.raw");
+        let configured_base = cache_dir.join("configured_base.raw");
         let instance_disk = instance_dir.join("instance.raw");
         let machine_identifier = instance_dir.join("machine.id");
         let efi_variable_store = instance_dir.join("efi-variable-store");
+        let cargo_registry = home.join(".cargo/registry");
         let console_log = instance_dir.join("console.log");
         let origin_marker = cache_dir.join("image.origin");
+        let configured_marker = cache_dir.join("configured_base.done");
 
         Ok(Self {
             project_root,
             project_name,
             cache_dir,
+            guest_mise_cache,
             instance_dir,
             downloaded_image,
             base_raw,
+            configured_base,
             instance_disk,
             machine_identifier,
             efi_variable_store,
+            cargo_registry,
             console_log,
             origin_marker,
+            configured_marker,
         })
     }
 }
@@ -119,18 +135,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let paths = VmPaths::new()?;
 
     prepare_directories(&paths)?;
+    create_console_log(&paths)?;
     download_base_image(&paths)?;
     convert_to_raw(&paths)?;
-    ensure_instance_disk(&paths)?;
-    create_console_log(&paths)?;
+    ensure_configured_base(&paths)?;
+    let provision_needed = ensure_instance_disk(&paths)?;
 
-    let config = create_vm_configuration(&paths)?;
-    run_vm(config)
+    let config = create_vm_configuration(&paths, &paths.instance_disk)?;
+    run_vm(config, provision_needed, &paths, MountMode::MountAndChown)
 }
 
 fn prepare_directories(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(&paths.cache_dir)?;
+    fs::create_dir_all(&paths.guest_mise_cache)?;
     fs::create_dir_all(&paths.instance_dir)?;
+    fs::create_dir_all(&paths.cargo_registry)?;
     Ok(())
 }
 
@@ -231,23 +250,42 @@ fn convert_to_raw(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn ensure_instance_disk(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
+fn ensure_configured_base(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
+    if paths.configured_base.exists() && paths.configured_marker.exists() {
+        println!(
+            "Using cached configured base at {}",
+            paths.configured_base.display()
+        );
+        return Ok(());
+    }
+
+    println!("Preparing configured base image...");
+    clone_sparse(&paths.base_raw, &paths.configured_base)?;
+    resize_file(&paths.configured_base, DISK_SIZE_GB)?;
+
+    let config = create_vm_configuration(paths, &paths.configured_base)?;
+    let _ = run_vm(config, true, paths, MountMode::SkipMounts)?;
+    fs::write(&paths.configured_marker, "ok")?;
+    Ok(())
+}
+
+fn ensure_instance_disk(paths: &VmPaths) -> Result<bool, Box<dyn std::error::Error>> {
     if paths.instance_disk.exists() {
         if validate_image(&paths.instance_disk, "instance raw") {
             println!(
                 "Using existing instance disk at {}",
                 paths.instance_disk.display()
             );
-            return Ok(());
+            return Ok(false);
         }
         println!("Instance disk invalid, recreating...");
         fs::remove_file(&paths.instance_disk).ok();
     }
 
     println!("Creating instance disk from cached base image...");
-    clone_sparse(&paths.base_raw, &paths.instance_disk)?;
+    clone_sparse(&paths.configured_base, &paths.instance_disk)?;
     resize_file(&paths.instance_disk, DISK_SIZE_GB)?;
-    Ok(())
+    Ok(true)
 }
 
 fn create_console_log(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
@@ -262,6 +300,7 @@ fn create_console_log(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>>
 
 fn create_vm_configuration(
     paths: &VmPaths,
+    disk_path: &Path,
 ) -> Result<Retained<VZVirtualMachineConfiguration>, Box<dyn std::error::Error>> {
     unsafe {
         let platform =
@@ -279,7 +318,7 @@ fn create_vm_configuration(
         config.setCPUCount(CPU_COUNT as NSUInteger);
         config.setMemorySize(RAM_BYTES);
 
-        let disk_attachment = create_disk_attachment(&paths.instance_disk, false)?;
+        let disk_attachment = create_disk_attachment(disk_path, false)?;
         let disk_device = VZVirtioBlockDeviceConfiguration::initWithAttachment(
             VZVirtioBlockDeviceConfiguration::alloc(),
             &disk_attachment,
@@ -300,6 +339,21 @@ fn create_vm_configuration(
         let entropy_devices: Retained<NSArray<_>> =
             NSArray::from_retained_slice(&[Retained::into_super(entropy_device)]);
         config.setEntropyDevices(&entropy_devices);
+
+        let directory_shares = [
+            ("cargo_registry", &paths.cargo_registry, true),
+            ("mise_cache", &paths.guest_mise_cache, false),
+            ("current_dir", &paths.project_root, false),
+        ];
+
+        let mut share_devices: Vec<Retained<_>> = Vec::new();
+        for (tag, path, read_only) in directory_shares {
+            let device = create_directory_share(tag, path, read_only)?;
+            share_devices.push(Retained::into_super(device));
+        }
+
+        let share_devices: Retained<NSArray<_>> = NSArray::from_retained_slice(&share_devices);
+        config.setDirectorySharingDevices(&share_devices);
 
         let stdin_handle = NSFileHandle::fileHandleWithStandardInput();
         let stdout_handle = NSFileHandle::fileHandleWithStandardOutput();
@@ -400,6 +454,44 @@ fn load_efi_variable_store(
     }
 }
 
+fn start_script_thread(script: String) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        // Wait for getty to appear, then log in and run the script.
+        thread::sleep(Duration::from_secs(8));
+        if let Ok(mut stdin) = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/stdin")
+        {
+            let payload = format!(
+                "\nroot\ncat >/root/provision.sh <<'EOF'\n{script}EOF\nchmod +x /root/provision.sh\n/root/provision.sh\n",
+                script = script
+            );
+            let _ = stdin.write_all(payload.as_bytes());
+            let _ = stdin.flush();
+        }
+    })
+}
+
+fn format_provision_script(project_name: &str) -> String {
+    PROVISION_SCRIPT
+        .replace("{project_name}", project_name)
+        .replace("{mount_service}", VIRTIOFS_MOUNT_SERVICE)
+}
+
+fn format_mount_script(paths: &VmPaths) -> String {
+    format!(
+        r#"root
+mkdir -p /home/vibe/.cargo/registry /home/vibe/.local/share/mise /home/vibe/{project} || true
+mount -t virtiofs cargo_registry /home/vibe/.cargo/registry || true
+mount -t virtiofs mise_cache /home/vibe/.local/share/mise || true
+mount -t virtiofs current_dir /home/vibe/{project} || true
+chown -R vibe:vibe /home/vibe/.cargo /home/vibe/.local/share/mise /home/vibe/{project} || true
+exit
+"#,
+        project = paths.project_name
+    )
+}
+
 fn create_disk_attachment(
     path: &Path,
     read_only: bool,
@@ -417,8 +509,47 @@ fn create_disk_attachment(
     }
 }
 
+fn create_directory_share(
+    tag: &str,
+    path: &Path,
+    read_only: bool,
+) -> Result<Retained<VZVirtioFileSystemDeviceConfiguration>, Box<dyn std::error::Error>> {
+    unsafe {
+        let ns_tag = NSString::from_str(tag);
+        VZVirtioFileSystemDeviceConfiguration::validateTag_error(&ns_tag).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Invalid virtiofs tag {}: {:?}", tag, e),
+            )
+        })?;
+
+        let url = nsurl_from_path(path)?;
+        let shared_directory =
+            VZSharedDirectory::initWithURL_readOnly(VZSharedDirectory::alloc(), &url, read_only);
+        let single_share = VZSingleDirectoryShare::initWithDirectory(
+            VZSingleDirectoryShare::alloc(),
+            &shared_directory,
+        );
+
+        let device = VZVirtioFileSystemDeviceConfiguration::initWithTag(
+            VZVirtioFileSystemDeviceConfiguration::alloc(),
+            &ns_tag,
+        );
+        device.setShare(Some(&single_share));
+        Ok(device)
+    }
+}
+
+enum MountMode {
+    SkipMounts,
+    MountAndChown,
+}
+
 fn run_vm(
     config: Retained<VZVirtualMachineConfiguration>,
+    provision: bool,
+    paths: &VmPaths,
+    mount_mode: MountMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting VM with Apple Virtualization Framework...");
 
@@ -457,6 +588,18 @@ fn run_vm(
     unsafe {
         vm.startWithCompletionHandler(&completion_handler);
     }
+
+    let provision_thread = if provision && !paths.configured_marker.exists() {
+        let script = format_provision_script(&paths.project_name);
+        Some(start_script_thread(script))
+    } else {
+        None
+    };
+
+    let mount_thread = match mount_mode {
+        MountMode::SkipMounts => None,
+        MountMode::MountAndChown => Some(start_script_thread(format_mount_script(paths))),
+    };
 
     let start_deadline = Instant::now() + START_TIMEOUT;
     while Instant::now() < start_deadline {
@@ -507,6 +650,13 @@ fn run_vm(
     }
 
     drop(raw_guard);
+    if let Some(handle) = provision_thread {
+        let _ = handle.join();
+        fs::write(&paths.configured_marker, "ok")?;
+    }
+    if let Some(handle) = mount_thread {
+        let _ = handle.join();
+    }
     Ok(())
 }
 
