@@ -110,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provision_needed = ensure_instance_disk(&paths)?;
 
     let config = create_vm_configuration(&paths, &paths.instance_disk)?;
-    run_vm(config, provision_needed, &paths, MountMode::MountAndChown)
+    run_vm(config, provision_needed, &paths, MountMode::SkipMounts)
 }
 
 fn prepare_directories(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
@@ -215,7 +215,7 @@ fn ensure_configured_base(paths: &VmPaths) -> Result<(), Box<dyn std::error::Err
     resize_file(&paths.configured_base, DISK_SIZE_GB)?;
 
     let config = create_vm_configuration(paths, &paths.configured_base)?;
-    let _ = run_vm(config, true, paths, MountMode::SkipMounts)?;
+    run_vm(config, true, paths, MountMode::SkipMounts)?;
 
     Ok(())
 }
@@ -313,20 +313,21 @@ fn create_vm_configuration(
         let share_devices: Retained<NSArray<_>> = NSArray::from_retained_slice(&share_devices);
         config.setDirectorySharingDevices(&share_devices);
 
-        let stdin_handle = NSFileHandle::fileHandleWithStandardInput();
-        let (console_write_handle, tee_thread, inject_fd) = tee_console_to_log(&paths.console_log)?;
+        let (ns_read_handle, ns_write_handle, inject_write_fd, tee_thread) =
+            tee_console_to_log(&paths.console_log)?;
 
-        let serial_attachment =
+        // Single bidirectional serial port
+        let serial_attach =
             VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
                 VZFileHandleSerialPortAttachment::alloc(),
-                Some(&stdin_handle),
-                Some(&console_write_handle),
+                Some(&ns_read_handle),
+                Some(&ns_write_handle),
             );
-        let serial_console = VZVirtioConsoleDeviceSerialPortConfiguration::new();
-        serial_console.setAttachment(Some(&serial_attachment));
+        let serial_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
+        serial_port.setAttachment(Some(&serial_attach));
 
         let serial_ports: Retained<NSArray<_>> =
-            NSArray::from_retained_slice(&[Retained::into_super(serial_console)]);
+            NSArray::from_retained_slice(&[Retained::into_super(serial_port)]);
         config.setSerialPorts(&serial_ports);
 
         config.validateWithError().map_err(|e| {
@@ -336,7 +337,7 @@ fn create_vm_configuration(
             )
         })?;
 
-        Ok((config, tee_thread, inject_fd))
+        Ok((config, tee_thread, inject_write_fd))
     }
 }
 
@@ -403,10 +404,7 @@ fn start_script_thread(
             eprintln!("Timed out waiting for login prompt; skipping injected script");
             return;
         }
-
-        let payload = format!(
-            "\nroot\ncat >/root/provision.sh <<'EOF'\n{script}EOF\nchmod +x /root/provision.sh\n/root/provision.sh\n",
-        );
+        eprintln!("provisioning...");
 
         // Duplicate the write fd so we don't close the one held by the serial port.
         unsafe {
@@ -416,10 +414,20 @@ fn start_script_thread(
                 return;
             }
             let mut stdin = File::from_raw_fd(dup_fd);
-            if let Err(e) = stdin.write_all(payload.as_bytes()) {
-                eprintln!("Failed to write payload to VM serial: {}", e);
-            }
-            let _ = stdin.flush();
+
+            let mut do_write = |payload: &str| {
+                if let Err(e) = stdin.write_all(payload.as_bytes()) {
+                    eprintln!("Failed to write payload to VM serial: {}", e);
+                }
+                let _ = stdin.flush();
+            };
+
+            do_write("root\n");
+            std::thread::sleep(Duration::from_millis(500));
+
+            do_write( &format!(
+           "root\ncat >/root/provision.sh <<'EOF'\n{script}EOF\nchmod +x /root/provision.sh\n/root/provision.sh\n",
+       ));
         }
     })
 }
@@ -461,26 +469,45 @@ fn tee_console_to_log(
 ) -> Result<
     (
         Retained<NSFileHandle>,
-        Option<thread::JoinHandle<()>>,
+        Retained<NSFileHandle>,
         RawFd,
+        Option<thread::JoinHandle<()>>,
     ),
     Box<dyn std::error::Error>,
 > {
-    let mut fds = [0; 2];
-    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
-    if rc != 0 {
+    // Pipe for guest output: guest writes to out_write_fd, we read from out_read_fd
+    let mut out_fds = [0; 2];
+    if unsafe { libc::pipe(out_fds.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error().into());
     }
-    let read_fd = fds[0];
-    let write_fd = fds[1];
+    let out_read_fd = out_fds[0];
+    let out_write_fd = out_fds[1];
 
-    let handle = NSFileHandle::alloc();
-    let ns_write_handle =
-        NSFileHandle::initWithFileDescriptor_closeOnDealloc(handle, write_fd, true);
+    // Pipe for guest input: we write to in_write_fd, guest reads from in_read_fd
+    let mut in_fds = [0; 2];
+    if unsafe { libc::pipe(in_fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    let in_read_fd = in_fds[0];
+    let in_write_fd = in_fds[1];
+
+    // NSFileHandle for guest to read from (our injected input)
+    let ns_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+        NSFileHandle::alloc(),
+        in_read_fd,
+        true,
+    );
+
+    // NSFileHandle for guest to write to (console output)
+    let ns_write_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+        NSFileHandle::alloc(),
+        out_write_fd,
+        true,
+    );
 
     let log_path = log_path.to_path_buf();
     let tee_thread = thread::spawn(move || {
-        let mut reader = unsafe { File::from_raw_fd(read_fd) };
+        let mut reader = unsafe { File::from_raw_fd(out_read_fd) };
         let mut log = OpenOptions::new()
             .create(true)
             .write(true)
@@ -499,7 +526,12 @@ fn tee_console_to_log(
         }
     });
 
-    Ok((ns_write_handle, Some(tee_thread), write_fd))
+    Ok((
+        ns_read_handle,
+        ns_write_handle,
+        in_write_fd,
+        Some(tee_thread),
+    ))
 }
 
 fn create_disk_attachment(
