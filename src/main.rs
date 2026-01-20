@@ -1,8 +1,7 @@
 use std::env;
-use std::ffi::CString;
+
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{AsRawFd, IntoRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -31,7 +30,7 @@ use objc2_virtualization::{
 };
 
 const DEBIAN_DISK_URL: &str =
-    "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-nocloud-arm64.qcow2";
+    "https://cloud.debian.org/images/cloud/trixie/20260112-2355/debian-13-nocloud-arm64-20260112-2355.tar.xz";
 const PROVISION_SCRIPT: &str = include_str!("../provisioning/provision.sh");
 
 const DISK_SIZE_GB: u64 = 10;
@@ -46,7 +45,7 @@ struct VmPaths {
     cache_dir: PathBuf,
     guest_mise_cache: PathBuf,
     instance_dir: PathBuf,
-    downloaded_qcow2: PathBuf,
+    base_compressed: PathBuf,
     base_raw: PathBuf,
     configured_raw: PathBuf,
     instance_raw: PathBuf,
@@ -71,8 +70,12 @@ impl VmPaths {
         let guest_mise_cache = cache_dir.join(".guest-mise-cache");
         let instance_dir = project_root.join(".vibe");
 
-        let downloaded_image = cache_dir.join("downloaded.qcow2");
-        let base_raw = cache_dir.join("base.raw");
+        let basename_compressed = DEBIAN_DISK_URL.rsplit('/').next().unwrap();
+        let base_compressed = cache_dir.join(basename_compressed);
+
+        let basename = basename_compressed.trim_end_matches(".tar.xz");
+        let base_raw = cache_dir.join(format!("{}.raw", basename));
+
         let configured_base = cache_dir.join("configured_base.raw");
         let instance_disk = instance_dir.join("instance.raw");
         let efi_variable_store = instance_dir.join("efi-variable-store");
@@ -84,7 +87,7 @@ impl VmPaths {
             cache_dir,
             guest_mise_cache,
             instance_dir,
-            downloaded_qcow2: downloaded_image,
+            base_compressed,
             base_raw,
             configured_raw: configured_base,
             instance_raw: instance_disk,
@@ -153,10 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     prepare_directories(&paths)?;
     ensure_base_image(&paths)?;
-    convert_to_raw(&paths)?;
-
     ensure_configured_base(&paths)?;
-
     ensure_instance_disk(&paths)?;
 
     let config = create_vm_configuration(&paths, &paths.instance_raw)?;
@@ -172,63 +172,37 @@ fn prepare_directories(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>
 }
 
 fn ensure_base_image(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
-    if paths.downloaded_qcow2.exists() {
-        println!("Reusing base image at {}", paths.downloaded_qcow2.display());
-    } else {
-        println!("Downloading Debian base image...");
-        let status = Command::new("curl")
-            .args([
-                "-L",
-                "-f",
-                DEBIAN_DISK_URL,
-                "-o",
-                paths.downloaded_qcow2.to_string_lossy().as_ref(),
-            ])
-            .status()?;
-
-        if !status.success() {
-            return Err("Failed to download Debian base image".into());
-        }
-    }
-
-    validate_image(&paths.downloaded_qcow2, "base image");
-
-    Ok(())
-}
-
-fn convert_to_raw(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
     if paths.base_raw.exists() {
-        if validate_image(&paths.base_raw, " base raw") {
-            println!(
-                "Reusing converted base image at {}",
-                paths.base_raw.display()
-            );
-            return Ok(());
-        }
-        println!("base image invalid, regenerating...");
-        fs::remove_file(&paths.base_raw).ok();
+        println!("Reusing base image at {}", paths.base_raw.display());
+        return Ok(());
     }
 
-    println!("Converting source image to raw...");
-    let status = Command::new("qemu-img")
+    println!("Downloading Debian base image...");
+    let status = Command::new("curl")
         .args([
-            "convert",
-            "-O",
-            "raw",
-            paths.downloaded_qcow2.to_string_lossy().as_ref(),
-            paths.base_raw.to_string_lossy().as_ref(),
+            "--compressed",
+            "--location",
+            "--fail",
+            "-o",
+            &paths.base_compressed.to_string_lossy(),
+            DEBIAN_DISK_URL,
         ])
         .status()?;
 
     if !status.success() {
-        return Err("Failed to convert qcow2 image to raw".into());
+        return Err("Failed to download Debian base image".into());
     }
 
-    validate_image(&paths.base_raw, "converted base raw")
-        .then_some(())
-        .ok_or_else(|| io::Error::other("Converted base image failed validation"))?;
+    println!("Decompressing Debian base image...");
+    let status = Command::new("tar")
+        .args(["-xOf", &paths.base_compressed.to_string_lossy(), "disk.raw"])
+        .stdout(std::fs::File::create(&paths.base_raw).unwrap())
+        .status()?;
 
-    resize(&paths.base_raw, DISK_SIZE_GB)?;
+    if !status.success() {
+        return Err("Failed to decompress Debian base image".into());
+    }
+
     Ok(())
 }
 
@@ -253,15 +227,7 @@ fn ensure_configured_base(paths: &VmPaths) -> Result<(), Box<dyn std::error::Err
 
 fn ensure_instance_disk(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
     if paths.instance_raw.exists() {
-        if validate_image(&paths.instance_raw, "instance raw") {
-            println!(
-                "Using existing instance disk at {}",
-                paths.instance_raw.display()
-            );
-            return Ok(());
-        }
-        println!("Instance disk invalid, recreating...");
-        fs::remove_file(&paths.instance_raw).ok();
+        return Ok(());
     }
 
     println!("Creating instance disk from configured base image...");
@@ -699,19 +665,6 @@ fn resize(path: &Path, size_gb: u64) -> Result<(), Box<dyn std::error::Error>> {
     let file = fs::OpenOptions::new().write(true).open(path)?;
     file.set_len(size_bytes)?;
     Ok(())
-}
-
-fn validate_image(path: &Path, label: &str) -> bool {
-    let output = Command::new("qemu-img")
-        .args(["info", path.to_string_lossy().as_ref()])
-        .output();
-    match output {
-        Ok(out) if out.status.success() => true,
-        _ => {
-            eprintln!("Validation failed for {} at {}", label, path.display());
-            false
-        }
-    }
 }
 
 fn enable_raw_mode(fd: i32) -> io::Result<RawModeGuard> {
