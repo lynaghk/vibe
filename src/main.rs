@@ -2,7 +2,7 @@ use std::env;
 
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::io::{AsRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -16,87 +16,106 @@ use std::time::{Duration, Instant};
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
 use objc2::AnyThread;
-use objc2_foundation::{
-    NSArray, NSDate, NSDefaultRunLoopMode, NSError, NSFileHandle, NSRunLoop, NSString, NSUInteger,
-    NSURL,
-};
-use objc2_virtualization::{
-    VZDiskImageCachingMode, VZDiskImageStorageDeviceAttachment, VZDiskImageSynchronizationMode,
-    VZEFIBootLoader, VZEFIVariableStore, VZEFIVariableStoreInitializationOptions,
-    VZFileHandleSerialPortAttachment, VZGenericPlatformConfiguration, VZNATNetworkDeviceAttachment,
-    VZSharedDirectory, VZSingleDirectoryShare, VZVirtioBlockDeviceConfiguration,
-    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioEntropyDeviceConfiguration,
-    VZVirtioFileSystemDeviceConfiguration, VZVirtioNetworkDeviceConfiguration, VZVirtualMachine,
-    VZVirtualMachineConfiguration,
-};
+use objc2_foundation::*;
+use objc2_virtualization::*;
 
 const DEBIAN_DISK_URL: &str =
     "https://cloud.debian.org/images/cloud/trixie/20260112-2355/debian-13-nocloud-arm64-20260112-2355.tar.xz";
-const PROVISION_SCRIPT: &str = include_str!("../provisioning/provision.sh");
 
 const DISK_SIZE_GB: u64 = 10;
 const CPU_COUNT: usize = 4;
 const RAM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 
-#[derive(Debug)]
-struct VmPaths {
-    project_root: PathBuf,
-    project_name: String,
-    cache_dir: PathBuf,
-    guest_mise_cache: PathBuf,
-    instance_dir: PathBuf,
-    base_compressed: PathBuf,
-    base_raw: PathBuf,
-    configured_raw: PathBuf,
-    instance_raw: PathBuf,
-    efi_variable_store: PathBuf,
-    cargo_registry: PathBuf,
+#[derive(Clone)]
+enum LoginActions {
+    WaitFor(String),
+    Type(String),
+}
+use LoginActions::*;
+
+struct DirectoryShare {
+    host: PathBuf,
+    guest: PathBuf,
+    read_only: bool,
 }
 
-impl VmPaths {
-    fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let project_root = env::current_dir()?;
-        let project_name = project_root
+impl DirectoryShare {
+    fn tag(&self) -> String {
+        let path_str = self.host.to_string_lossy();
+        let hash = path_str
+            .bytes()
+            .fold(5381u64, |h, b| h.wrapping_mul(33).wrapping_add(b as u64));
+        let base_name = self
+            .host
             .file_name()
-            .ok_or("Project directory has no name")?
-            .to_string_lossy()
-            .into_owned();
-
-        let home = env::var("HOME").map(PathBuf::from)?;
-        let cache_home = env::var("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| home.join(".cache"));
-        let cache_dir = cache_home.join("vibe");
-        let guest_mise_cache = cache_dir.join(".guest-mise-cache");
-        let instance_dir = project_root.join(".vibe");
-
-        let basename_compressed = DEBIAN_DISK_URL.rsplit('/').next().unwrap();
-        let base_compressed = cache_dir.join(basename_compressed);
-
-        let basename = basename_compressed.trim_end_matches(".tar.xz");
-        let base_raw = cache_dir.join(format!("{}.raw", basename));
-
-        let configured_base = cache_dir.join("configured_base.raw");
-        let instance_disk = instance_dir.join("instance.raw");
-        let efi_variable_store = instance_dir.join("efi-variable-store");
-        let cargo_registry = home.join(".cargo/registry");
-
-        Ok(Self {
-            project_root,
-            project_name,
-            cache_dir,
-            guest_mise_cache,
-            instance_dir,
-            base_compressed,
-            base_raw,
-            configured_raw: configured_base,
-            instance_raw: instance_disk,
-            efi_variable_store,
-            cargo_registry,
-        })
+            .map(|s| s.to_string_lossy())
+            .unwrap_or("share".into());
+        format!("{}_{:016x}", base_name, hash)
     }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let project_root = env::current_dir()?;
+    let project_name = project_root
+        .file_name()
+        .ok_or("Project directory has no name")?
+        .to_string_lossy()
+        .into_owned();
+
+    let home = env::var("HOME").map(PathBuf::from)?;
+    let cache_home = env::var("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home.join(".cache"));
+    let cache_dir = cache_home.join("vibe");
+    let guest_mise_cache = cache_dir.join(".guest-mise-cache");
+    let instance_dir = project_root.join(".vibe");
+
+    let basename_compressed = DEBIAN_DISK_URL.rsplit('/').next().unwrap();
+    let base_compressed = cache_dir.join(basename_compressed);
+
+    let base_raw = cache_dir.join(format!(
+        "{}.raw",
+        basename_compressed.trim_end_matches(".tar.xz")
+    ));
+
+    let configured_raw = cache_dir.join("configured_base.raw");
+    let instance_raw = instance_dir.join("instance.raw");
+    let cargo_registry = home.join(".cargo/registry");
+
+    // Prepare system-wide directories
+    fs::create_dir_all(&cache_dir)?;
+    fs::create_dir_all(&guest_mise_cache)?;
+
+    ensure_base_image(&base_raw, &base_compressed)?;
+
+    ensure_configured_base(&base_raw, &configured_raw)?;
+
+    ensure_instance_disk(&instance_raw, &configured_raw)?;
+
+    run_vm(
+        &instance_raw,
+        &[],
+        &[
+            DirectoryShare {
+                host: cargo_registry,
+                guest: "/home/root/.cargo/registry".into(),
+                read_only: false,
+            },
+            DirectoryShare {
+                host: guest_mise_cache,
+                guest: "/home/root/.local/share/mise".into(),
+                read_only: false,
+            },
+            DirectoryShare {
+                guest: PathBuf::from("/home/root/").join(project_name),
+                host: project_root,
+                read_only: false,
+            },
+        ],
+    )
 }
 
 #[derive(PartialEq, Eq)]
@@ -149,106 +168,80 @@ pub enum VmInput {
     Shutdown,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let paths = VmPaths::new()?;
-
-    prepare_directories(&paths)?;
-    ensure_base_image(&paths)?;
-    ensure_configured_base(&paths)?;
-    ensure_instance_disk(&paths)?;
-
-    run_vm(
-        &paths,
-        &paths.instance_raw,
-        vec![
-            LoginActions::WaitFor("login: ".to_string()),
-            LoginActions::Type("root\n".to_string()),
-        ],
-    )
-}
-
-fn prepare_directories(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
-    fs::create_dir_all(&paths.cache_dir)?;
-    fs::create_dir_all(&paths.guest_mise_cache)?;
-    fs::create_dir_all(&paths.instance_dir)?;
-    fs::create_dir_all(&paths.cargo_registry)?;
-    Ok(())
-}
-
-fn ensure_base_image(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
-    if paths.base_raw.exists() {
-        println!("Using configured image at {}", paths.base_raw.display());
+fn ensure_base_image(
+    base_raw: &Path,
+    base_compressed: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if base_raw.exists() {
         return Ok(());
     }
 
-    println!("Downloading Debian base image...");
+    println!("Downloading base image...");
     let status = Command::new("curl")
         .args([
             "--compressed",
             "--location",
             "--fail",
             "-o",
-            &paths.base_compressed.to_string_lossy(),
+            &base_compressed.to_string_lossy(),
             DEBIAN_DISK_URL,
         ])
         .status()?;
 
     if !status.success() {
-        return Err("Failed to download Debian base image".into());
+        return Err("Failed to download base image".into());
     }
 
-    println!("Decompressing Debian base image...");
+    println!("Decompressing base image...");
     let status = Command::new("tar")
-        .args(["-xOf", &paths.base_compressed.to_string_lossy(), "disk.raw"])
-        .stdout(std::fs::File::create(&paths.base_raw).unwrap())
+        .args(["-xOf", &base_compressed.to_string_lossy(), "disk.raw"])
+        .stdout(std::fs::File::create(base_raw).unwrap())
         .status()?;
 
     if !status.success() {
-        return Err("Failed to decompress Debian base image".into());
+        return Err("Failed to decompress base image".into());
     }
 
     Ok(())
 }
 
-fn ensure_configured_base(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
-    if paths.configured_raw.exists() {
-        println!(
-            "Using cached configured base at {}",
-            paths.configured_raw.display()
-        );
+fn ensure_configured_base(
+    base_raw: &Path,
+    configured_raw: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if configured_raw.exists() {
+        println!("Using configured base at {}", configured_raw.display());
         return Ok(());
     }
 
-    println!("Preparing configured base image...");
-    fs::copy(&paths.base_raw, &paths.configured_raw)?;
-    resize(&paths.configured_raw, DISK_SIZE_GB)?;
+    println!("Configuring base image...");
+    fs::copy(base_raw, configured_raw)?;
+    resize(configured_raw, DISK_SIZE_GB)?;
 
     run_vm(
-        paths,
-        &paths.configured_raw,
-        vec![
-            LoginActions::WaitFor("login: ".to_string()),
-            LoginActions::Type("root\n".to_string()),
-            LoginActions::WaitFor("~#".to_string()),
-            LoginActions::Type({
-                let path = "provision.sh";
-                let script = PROVISION_SCRIPT;
-                format!("cat >{path} <<'PROVISIONING_EOF'\n{script}PROVISIONING_EOF\nsh {path}\n")
-            }),
-        ],
+        configured_raw,
+        &[Type({
+            let path = "provision.sh";
+            let script = include_str!("../provisioning/provision.sh");
+            format!("cat >{path} <<'PROVISIONING_EOF'\n{script}PROVISIONING_EOF\nsh {path}\n")
+        })],
+        &[],
     )?;
 
     Ok(())
 }
 
-fn ensure_instance_disk(paths: &VmPaths) -> Result<(), Box<dyn std::error::Error>> {
-    if paths.instance_raw.exists() {
+fn ensure_instance_disk(
+    instance_raw: &Path,
+    configured_raw: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if instance_raw.exists() {
         return Ok(());
     }
 
     println!("Creating instance disk from configured base image...");
-    fs::copy(&paths.configured_raw, &paths.instance_raw)?;
-    resize(&paths.instance_raw, DISK_SIZE_GB)?;
+    fs::copy(configured_raw, instance_raw)?;
+    resize(instance_raw, DISK_SIZE_GB)?;
     Ok(())
 }
 
@@ -388,8 +381,8 @@ impl IoContext {
 }
 
 fn create_vm_configuration(
-    paths: &VmPaths,
     disk_path: &Path,
+    directory_shares: &[DirectoryShare],
     vm_reads_from_fd: OwnedFd,
     vm_writes_to_fd: OwnedFd,
 ) -> Result<Retained<VZVirtualMachineConfiguration>, Box<dyn std::error::Error>> {
@@ -398,7 +391,7 @@ fn create_vm_configuration(
             VZGenericPlatformConfiguration::init(VZGenericPlatformConfiguration::alloc());
 
         let boot_loader = VZEFIBootLoader::init(VZEFIBootLoader::alloc());
-        let variable_store = load_efi_variable_store(paths)?;
+        let variable_store = load_efi_variable_store()?;
         boot_loader.setVariableStore(Some(&variable_store));
 
         let config = VZVirtualMachineConfiguration::new();
@@ -407,102 +400,130 @@ fn create_vm_configuration(
         config.setCPUCount(CPU_COUNT as NSUInteger);
         config.setMemorySize(RAM_BYTES);
 
-        let disk_attachment = create_disk_attachment(disk_path, false)?;
-        let disk_device = VZVirtioBlockDeviceConfiguration::initWithAttachment(
-            VZVirtioBlockDeviceConfiguration::alloc(),
-            &disk_attachment,
-        );
+        config.setNetworkDevices(&NSArray::from_retained_slice(&[{
+            let network_device = VZVirtioNetworkDeviceConfiguration::new();
+            network_device.setAttachment(Some(&VZNATNetworkDeviceAttachment::new()));
+            Retained::into_super(network_device)
+        }]));
 
-        let storage_devices: Retained<NSArray<_>> =
-            NSArray::from_retained_slice(&[Retained::into_super(disk_device)]);
+        config.setEntropyDevices(&NSArray::from_retained_slice(&[Retained::into_super(
+            VZVirtioEntropyDeviceConfiguration::new(),
+        )]));
 
-        config.setStorageDevices(&storage_devices);
+        ////////////////////////////
+        // Disks
+        {
+            let disk_attachment = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_cachingMode_synchronizationMode_error(
+            VZDiskImageStorageDeviceAttachment::alloc(),
+            &nsurl_from_path(disk_path).unwrap(),
+            false,
+            VZDiskImageCachingMode::Automatic,
+            VZDiskImageSynchronizationMode::Full,
+        ).unwrap();
 
-        let nat_attachment = VZNATNetworkDeviceAttachment::new();
-        let network_device = VZVirtioNetworkDeviceConfiguration::new();
-        network_device.setAttachment(Some(&nat_attachment));
-        let network_devices: Retained<NSArray<_>> =
-            NSArray::from_retained_slice(&[Retained::into_super(network_device)]);
-        config.setNetworkDevices(&network_devices);
+            let disk_device = VZVirtioBlockDeviceConfiguration::initWithAttachment(
+                VZVirtioBlockDeviceConfiguration::alloc(),
+                &disk_attachment,
+            );
 
-        let entropy_device = VZVirtioEntropyDeviceConfiguration::new();
-        let entropy_devices: Retained<NSArray<_>> =
-            NSArray::from_retained_slice(&[Retained::into_super(entropy_device)]);
-        config.setEntropyDevices(&entropy_devices);
+            let storage_devices: Retained<NSArray<_>> =
+                NSArray::from_retained_slice(&[Retained::into_super(disk_device)]);
 
-        let directory_shares = [
-            ("cargo_registry", &paths.cargo_registry, true),
-            ("mise_cache", &paths.guest_mise_cache, false),
-            ("current_dir", &paths.project_root, false),
-        ];
+            config.setStorageDevices(&storage_devices);
+        };
 
-        let mut share_devices: Vec<Retained<_>> = Vec::new();
-        for (tag, path, read_only) in directory_shares {
-            let device = create_directory_share(tag, path, read_only)?;
-            share_devices.push(Retained::into_super(device));
+        ////////////////////////////
+        // Directory shares
+
+        if !directory_shares.is_empty() {
+            let directories: Retained<NSMutableDictionary<NSString, VZSharedDirectory>> =
+                NSMutableDictionary::new();
+
+            for share in directory_shares.iter() {
+                assert!(
+                    share.host.is_dir(),
+                    "path does not exist or is not a directory: {:?}",
+                    share.host
+                );
+
+                let url = nsurl_from_path(&share.host)?;
+                let shared_directory = VZSharedDirectory::initWithURL_readOnly(
+                    VZSharedDirectory::alloc(),
+                    &url,
+                    share.read_only,
+                );
+                let key = NSString::from_str(&share.guest.to_string_lossy());
+                directories.setObject_forKey(&*shared_directory, ProtocolObject::from_ref(&*key));
+            }
+
+            let multi_share = VZMultipleDirectoryShare::initWithDirectories(
+                VZMultipleDirectoryShare::alloc(),
+                &directories,
+            );
+            let device = VZVirtioFileSystemDeviceConfiguration::initWithTag(
+                VZVirtioFileSystemDeviceConfiguration::alloc(),
+                &NSString::from_str("shared"),
+            );
+            device.setShare(Some(&multi_share));
+
+            let share_devices = NSArray::from_retained_slice(&[device.into_super()]);
+            config.setDirectorySharingDevices(&share_devices);
         }
 
-        let share_devices: Retained<NSArray<_>> = NSArray::from_retained_slice(&share_devices);
-        config.setDirectorySharingDevices(&share_devices);
-
-        let ns_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
-            NSFileHandle::alloc(),
-            vm_reads_from_fd.into_raw_fd(),
-            true,
-        );
-
-        let ns_write_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
-            NSFileHandle::alloc(),
-            vm_writes_to_fd.into_raw_fd(),
-            true,
-        );
-
-        let serial_attach =
-            VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
-                VZFileHandleSerialPortAttachment::alloc(),
-                Some(&ns_read_handle),
-                Some(&ns_write_handle),
+        ////////////////////////////
+        // Serial port
+        {
+            let ns_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+                NSFileHandle::alloc(),
+                vm_reads_from_fd.into_raw_fd(),
+                true,
             );
-        let serial_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
-        serial_port.setAttachment(Some(&serial_attach));
 
-        let serial_ports: Retained<NSArray<_>> =
-            NSArray::from_retained_slice(&[Retained::into_super(serial_port)]);
+            let ns_write_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+                NSFileHandle::alloc(),
+                vm_writes_to_fd.into_raw_fd(),
+                true,
+            );
 
-        config.setSerialPorts(&serial_ports);
+            let serial_attach =
+                VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                    VZFileHandleSerialPortAttachment::alloc(),
+                    Some(&ns_read_handle),
+                    Some(&ns_write_handle),
+                );
+            let serial_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
+            serial_port.setAttachment(Some(&serial_attach));
 
+            let serial_ports: Retained<NSArray<_>> =
+                NSArray::from_retained_slice(&[Retained::into_super(serial_port)]);
+
+            config.setSerialPorts(&serial_ports);
+        }
+
+        ////////////////////////////
+        // Validate
         config.validateWithError().map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("Invalid VM configuration: {:?}", e.localizedDescription()),
-            )
+            io::Error::other(format!(
+                "Invalid VM configuration: {:?}",
+                e.localizedDescription()
+            ))
         })?;
 
         Ok(config)
     }
 }
 
-fn load_efi_variable_store(
-    paths: &VmPaths,
-) -> Result<Retained<VZEFIVariableStore>, Box<dyn std::error::Error>> {
+fn load_efi_variable_store() -> Result<Retained<VZEFIVariableStore>, Box<dyn std::error::Error>> {
     unsafe {
-        let url = nsurl_from_path(&paths.efi_variable_store)?;
+        let temp_dir = std::env::temp_dir();
+        let temp_path = temp_dir.join(format!("efi_variable_store_{}.efivars", std::process::id()));
+        let url = nsurl_from_path(&temp_path)?;
         let options = VZEFIVariableStoreInitializationOptions::AllowOverwrite;
         let store = VZEFIVariableStore::initCreatingVariableStoreAtURL_options_error(
             VZEFIVariableStore::alloc(),
             &url,
             options,
-        )
-        .map_err(|e| {
-            Box::<dyn std::error::Error>::from(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "Failed to create EFI variable store at {}: {:?}",
-                    paths.efi_variable_store.display(),
-                    e.localizedDescription()
-                ),
-            ))
-        })?;
+        )?;
         Ok(store)
     }
 }
@@ -515,7 +536,7 @@ fn spawn_login_actions_thread(
     thread::spawn(move || {
         for a in login_actions {
             match a {
-                LoginActions::WaitFor(text) => {
+                WaitFor(text) => {
                     if WaitResult::Timeout
                         == output_monitor.wait_for(&text, Duration::from_secs(120))
                     {
@@ -523,7 +544,7 @@ fn spawn_login_actions_thread(
                         return;
                     }
                 }
-                LoginActions::Type(text) => {
+                Type(text) => {
                     input_tx
                         .send(VmInput::Bytes(text.into_bytes().to_vec()))
                         .unwrap();
@@ -533,68 +554,15 @@ fn spawn_login_actions_thread(
     })
 }
 
-fn create_disk_attachment(
-    path: &Path,
-    read_only: bool,
-) -> Result<Retained<VZDiskImageStorageDeviceAttachment>, Box<dyn std::error::Error>> {
-    unsafe {
-        let url = nsurl_from_path(path)?;
-        VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_cachingMode_synchronizationMode_error(
-            VZDiskImageStorageDeviceAttachment::alloc(),
-            &url,
-            read_only,
-            VZDiskImageCachingMode::Automatic,
-            VZDiskImageSynchronizationMode::Full,
-        )
-        .map_err(|e| format!("Failed to attach disk {}: {:?}", path.display(), e).into())
-    }
-}
-
-fn create_directory_share(
-    tag: &str,
-    path: &Path,
-    read_only: bool,
-) -> Result<Retained<VZVirtioFileSystemDeviceConfiguration>, Box<dyn std::error::Error>> {
-    unsafe {
-        let ns_tag = NSString::from_str(tag);
-        VZVirtioFileSystemDeviceConfiguration::validateTag_error(&ns_tag).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Invalid virtiofs tag {}: {:?}", tag, e),
-            )
-        })?;
-
-        let url = nsurl_from_path(path)?;
-        let shared_directory =
-            VZSharedDirectory::initWithURL_readOnly(VZSharedDirectory::alloc(), &url, read_only);
-        let single_share = VZSingleDirectoryShare::initWithDirectory(
-            VZSingleDirectoryShare::alloc(),
-            &shared_directory,
-        );
-
-        let device = VZVirtioFileSystemDeviceConfiguration::initWithTag(
-            VZVirtioFileSystemDeviceConfiguration::alloc(),
-            &ns_tag,
-        );
-        device.setShare(Some(&single_share));
-        Ok(device)
-    }
-}
-
-enum LoginActions {
-    WaitFor(String),
-    Type(String),
-}
-
 fn run_vm(
-    paths: &VmPaths,
     disk_path: &Path,
-    login_actions: Vec<LoginActions>,
+    login_actions: &[LoginActions],
+    directory_shares: &[DirectoryShare],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (vm_reads_from, we_write_to) = create_pipe();
     let (we_read_from, vm_writes_to) = create_pipe();
 
-    let config = create_vm_configuration(paths, disk_path, vm_reads_from, vm_writes_to)?;
+    let config = create_vm_configuration(disk_path, directory_shares, vm_reads_from, vm_writes_to)?;
 
     println!("Starting VM");
 
@@ -648,8 +616,17 @@ fn run_vm(
     let output_monitor = Arc::new(OutputMonitor::new());
     let io_ctx = spawn_vm_io(output_monitor.clone(), we_read_from, we_write_to);
 
+    let default_login_actions = vec![
+        WaitFor("login: ".to_string()),
+        Type("root\n".to_string()),
+        WaitFor("~#".to_string()),
+    ];
+
     let login_actions_thread = spawn_login_actions_thread(
-        login_actions,
+        default_login_actions
+            .into_iter()
+            .chain(login_actions.iter().cloned())
+            .collect(),
         output_monitor.clone(),
         io_ctx.input_tx.clone(),
     );
