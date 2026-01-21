@@ -111,7 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         login_actions.push(Type(r"mount -t tmpfs tmpfs .git/".into()));
     }
 
-    let directory_shares = vec![
+    let mut directory_shares = vec![
         DirectoryShare {
             host: cargo_registry,
             guest: "/root/.cargo/registry".into(),
@@ -128,6 +128,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             read_only: false,
         },
     ];
+
+    {
+        let codex = home.join(".codex");
+        if codex.exists() {
+            directory_shares.push(DirectoryShare {
+                guest: PathBuf::from("/root/").join(".codex"),
+                host: codex,
+                read_only: false,
+            })
+        }
+    }
 
     run_vm(&instance_raw, &login_actions, &directory_shares[..])
 }
