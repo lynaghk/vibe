@@ -100,34 +100,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     ensure_instance_disk(&instance_raw, &configured_raw)?;
 
-    run_vm(
-        &instance_raw,
-        &[
-            Type(format!("cd {project_name}")),
-            // discourage read/write of .git folder from within the VM. note that this isn't secure, since the VM runs as root and could unmount this.
-            // I couldn't find an alternative way to do this --- the MacOS sandbox doesn't apply to the Apple Virtualization system, and
-            Type("mount -t tmpfs tmpfs .git/".into()),
-            Type("clear".into()),
-            // TODO: Add a nice entry message which shows the shared directories.
-        ],
-        &[
-            DirectoryShare {
-                host: cargo_registry,
-                guest: "/root/.cargo/registry".into(),
-                read_only: false,
-            },
-            DirectoryShare {
-                host: guest_mise_cache,
-                guest: "/root/.local/share/mise".into(),
-                read_only: false,
-            },
-            DirectoryShare {
-                guest: PathBuf::from("/root/").join(project_name),
-                host: project_root,
-                read_only: false,
-            },
-        ],
-    )
+    let mut login_actions = vec![Type(format!("cd {project_name}"))];
+
+    // TODO: Add a nice entry message which shows the shared directories.
+    login_actions.push(Type("clear".into()));
+
+    // discourage read/write of .git folder from within the VM. note that this isn't secure, since the VM runs as root and could unmount this.
+    // I couldn't find an alternative way to do this --- the MacOS sandbox doesn't apply to the Apple Virtualization system, and
+    if project_root.join(".git").exists() {
+        login_actions.push(Type(r"mount -t tmpfs tmpfs .git/".into()));
+    }
+
+    let directory_shares = vec![
+        DirectoryShare {
+            host: cargo_registry,
+            guest: "/root/.cargo/registry".into(),
+            read_only: false,
+        },
+        DirectoryShare {
+            host: guest_mise_cache,
+            guest: "/root/.local/share/mise".into(),
+            read_only: false,
+        },
+        DirectoryShare {
+            guest: PathBuf::from("/root/").join(project_name),
+            host: project_root,
+            read_only: false,
+        },
+    ];
+
+    run_vm(&instance_raw, &login_actions, &directory_shares[..])
 }
 
 #[derive(PartialEq, Eq)]
