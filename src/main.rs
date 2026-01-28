@@ -112,11 +112,6 @@ impl DirectoryShare {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = build_cli().get_matches();
 
-    if let Some(("show", sub_matches)) = matches.subcommand() {
-        let name = sub_matches.get_one::<String>("builtin").map(String::as_str);
-        return show_builtin_script(name);
-    }
-
     ensure_signed();
 
     let project_root = env::current_dir()?;
@@ -264,34 +259,6 @@ fn build_cli() -> ClapCommand {
                 .value_names(["STRING", "TIMEOUT"])
                 .value_parser(value_parser!(String)),
         )
-        .subcommand(
-            ClapCommand::new("show").arg(
-                Arg::new("builtin")
-                    .help("List built-in scripts or show the contents of the provided script name.")
-                    .value_name("BUILTIN")
-                    .value_parser(value_parser!(String)),
-            ),
-        )
-}
-
-fn show_builtin_script(name: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-    let builtins = [("provision.sh", PROVISION_SCRIPT)];
-    match name {
-        Some(requested) => {
-            if let Some((_, content)) = builtins.iter().find(|(n, _)| *n == requested) {
-                print!("{content}");
-                Ok(())
-            } else {
-                Err(format!("Unknown built-in file: {requested}").into())
-            }
-        }
-        None => {
-            for (name, _) in builtins {
-                println!("{name}");
-            }
-            Ok(())
-        }
-    }
 }
 
 fn collect_ordered_actions(

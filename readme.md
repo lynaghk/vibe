@@ -35,7 +35,7 @@ Alternatively, if you want to modify it for your own needs, all you need is a Ru
 
 ## Using Vibe
 
-Vibe can be invoked in several ways:
+Vibe can be invoked in two ways:
 
 - `vibe` is the "do what I mean" default invocation, which:
   - shares the current directory with the VM
@@ -50,9 +50,6 @@ Vibe can be invoked in several ways:
   There is no centralized registry of VMs --- if you want to delete a VM, just delete its disk image file.
   
 - `vibe path/to/disk.raw` works as above, but uses the specified disk image (which must exist) rather than the one at `.vibe/instance.raw`.
-
-- `vibe show [built-in-file.sh]` prints the contents of a default shell script built into the binary, so you can see how things work.
-   If no argument is given, a list of all built-in scripts will be returned.
 
 The behavior of `vibe` can be modified with these command line flags, which may be provided at most once:
 
