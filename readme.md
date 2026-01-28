@@ -1,12 +1,26 @@
-# Vibe
-
 Vibe is a quick, zero-configuration way to spin up a Linux virtual machine on Mac to sandbox LLM agents:
 
 ```
-cd my-project/
-vibe
-# wait ~5 seconds
-# you are now in a Linux VM, which has shared access to your my-project/ directory
+$ cd my-project
+$ vibe
+
+░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░▒▓███████▓▒░░▒▓████████▓▒░
+░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░
+ ░▒▓█▓▒▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░
+ ░▒▓█▓▒▒▓█▓▒░░▒▓█▓▒░▒▓███████▓▒░░▒▓██████▓▒░
+  ░▒▓█▓▓█▓▒░ ░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░
+  ░▒▓█▓▓█▓▒░ ░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░
+   ░▒▓██▓▒░  ░▒▓█▓▒░▒▓███████▓▒░░▒▓████████▓▒░
+
+Host                                      Guest                    Mode
+----------------------------------------  -----------------------  ----------
+/Users/dev/.cache/vibe/.guest-mise-cache  /root/.local/share/mise  read-write
+/Users/dev/work/my-project                /root/my-project         read-write
+/Users/dev/.m2                            /root/.m2                read-write
+/Users/dev/.cargo/registry                /root/.cargo/registry    read-write
+/Users/dev/.codex                         /root/.codex             read-write
+
+root@localhost:~/my-project#
 ```
 
 Dependencies:
@@ -28,6 +42,10 @@ I'm not making formal releases or keeping a changelog, so your best bet is to gr
 If you don't plan on making any changes yourself to the code, you can do:
 
     cargo install --locked --git ssh://git@github.com/lynaghk/vibe.git
+
+If you don't have `cargo`, you need to install Rust:
+
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 
 ## Using Vibe
@@ -138,7 +156,7 @@ I'm not sure about (but open to discussing proposals via GitHub issues):
 
 - running VMs in the background
 - using SSH as a login mechanism; this would eliminate the current stdin/stdout-to-console plumbing (yay!) but require additional setup/configuration (boo!)
-
+- alternatives to the `--send` and `--expect` CLI flags; getting them in the right order via Clap requires some effort (and it might be nice to drop the Clap dependency entirely anyway...)
 
 I'm not interested in:
 
