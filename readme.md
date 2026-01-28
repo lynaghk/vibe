@@ -23,11 +23,34 @@ Host                                      Guest                    Mode
 root@localhost:~/my-project#
 ```
 
+On my M1 MacBook Air it takes ~10 seconds to boot.
+
+
 Dependencies:
 
 - An ARM-based Mac running MacOS 13 (Ventura) or higher.
 - A network connection is required on the first run to download and configure the Debian Linux base image.
 - That's it!
+
+
+## Why use Vibe?
+
+- LLM agents are more fun to use with `--yolo`, since they're not always interrupting you to approve their commands.
+- Sandboxing the agent in a VM lets it install/remove whatever tools its lil' transformer heart desires, *without* wrecking your actual machine.
+- You control what the agent (and thus the upstream LLM provider) can actually see, by controlling exactly what's shared into the VM sandbox.
+  (This project was inspired by me running `codex` *without* `--yolo` and seeing it reading files outside of the directory I started it in --- not cool, bro.)
+
+I'm using virtual machines rather than containers because:
+
+- Virtualization is more secure against malicious escapes than containers or the MacOS sandbox framework.
+- Containers on MacOS require spinning up a virtual machine anyway.
+
+Finally, as a matter of taste and style:
+
+- I wrote the entire README myself, 100% with my human brain.
+- The entire implementation is in one ~1200 line Rust file.
+- The only Rust dependencies are the [Objc2](https://github.com/madsmtm/objc2) interop crates and the [clap](https://github.com/clap-rs/clap/) argument parser.
+- There are no emojis anywhere in this repository.
 
 
 ## Install
@@ -38,7 +61,7 @@ I'm not making formal releases or keeping a changelog, so your best bet is to gr
     git clone ssh://git@github.com:lynaghk/vibe
     cd vibe
     cargo install
-    
+
 If you don't plan on making any changes yourself to the code, you can do:
 
     cargo install --locked --git ssh://git@github.com/lynaghk/vibe.git
@@ -59,11 +82,11 @@ Vibe can be invoked in two ways:
 
   The first time you run `vibe`, a Debian Linux image is downloaded to `~/.cache/vibe/`, configured with basic tools like gcc, [mise-en-place](https://mise.jdx.dev/), ripgrep, etc., and saved as `default.raw`.
   Then when you run `vibe` in a project directory, it copies this default image to `.vibe/instance.raw`, boots it up, and attaches your terminal to this VM.
-  
+
   When you `exit` this shell, the VM is shutdown.
   The disk state persists until you delete it.
   There is no centralized registry of VMs --- if you want to delete a VM, just delete its disk image file.
-  
+
 - `vibe path/to/disk.raw` works as above, but uses the specified disk image (which must exist) rather than the one at `.vibe/instance.raw`.
 
 The behavior of `vibe` can be modified with these command line flags, which may be provided at most once:
@@ -99,12 +122,12 @@ These flags can be provided as many times as desired:
 
 - Debian "nocloud" is used as a base image because it boots directly to a root prompt.
   The other images use [cloudinit](https://cloudinit.readthedocs.io/en/latest/), which I found much more complex:
- - Network requests are made during the boot process, and if you're offline they take several *minutes* to timeout before the login prompt is reached (thanks, `systemd-networkd-wait-online.service`).
- - Subsequent boots are much slower (at least, I couldn't easily figure out how to remove the associated cloud init machinery).
+  - Network requests are made during the boot process, and if you're offline they take several *minutes* to timeout before the login prompt is reached (thanks, `systemd-networkd-wait-online.service`).
+  - Subsequent boots are much slower (at least, I couldn't easily figure out how to remove the associated cloud init machinery).
+
 
 ## Alternatives
 
-I started this project in 2026 Jan after I noticed OpenAI's Codex agent reading files outside of the directory I'd started it in (not cool, bro!).
 Here's what I tried before writing this solution:
 
 - [Sandboxtron](https://github.com/lynaghk/sandboxtron/) - My own little wrapper around Mac's `sandbox-exec`.
@@ -116,7 +139,7 @@ I considered writing my own sandboxing rules and running the agents `--yolo`, bu
   - The CLI flags *mutate hidden state*. E.g., If you `limactl start --mount foo` and then later `limactl start --mount bar`, both `foo` and `bar` will be mounted.
   - Some capabilities are only available via yaml. E.g., the `--mount` CLI flag always mounts at the same path in the guest. If you want to mount at a different path, you have to do that via YAML.
   - There are many layers of inheritance/defaults, so even if you do write YAML, you can't see the full configuration.
-  
+
 - [Vagrant](https://developer.hashicorp.com/vagrant/) - I fondly remember using this back in the early 2010's, but based on this [2025 Reddit discussion](https://www.reddit.com/r/devops/comments/1axws75/vagrant_doesnt_support_mac_m1/) it seemed like running it on an ARM-based Mac was A Project and so I figured it'd be easier to roll my own thing.
 
 - [Tart](https://tart.run/) - I found this via some positive HN comments, but unfortunately wasn't able to run the release binary from their GitHub because it's not signed.
