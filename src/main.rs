@@ -203,6 +203,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 false,
             ),
             DirectoryShare::new(home.join(".codex"), "/root/.codex".into(), false),
+            DirectoryShare::new(home.join(".claude"), "/root/.claude".into(), false),
         ]
         .into_iter()
         .flatten()
