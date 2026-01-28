@@ -28,9 +28,11 @@ sleep 100 # sleep here so that we don't see the login screen flash up before the
 EOF
 
 
+# Install Rust
+curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --component "rustfmt,clippy"
+
 
 # Install Mise
-
 curl https://mise.run | sh
 echo 'eval "$(~/.local/bin/mise activate bash)"' >> .bashrc
 
