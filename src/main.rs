@@ -2,18 +2,20 @@ use std::{
     env,
     ffi::OsString,
     fs,
-    io::{self, Read, Write},
-    os::unix::{
-        io::{AsRawFd, IntoRawFd, OwnedFd},
-        net::UnixStream,
-        process::CommandExt,
+    io::{self, Write},
+    os::{
+        fd::RawFd,
+        unix::{
+            io::{AsRawFd, IntoRawFd, OwnedFd},
+            net::UnixStream,
+            process::CommandExt,
+        },
     },
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, Sender},
         Arc, Condvar, Mutex,
+        mpsc::{self, Receiver, Sender},
     },
     thread,
     time::{Duration, Instant},
@@ -22,7 +24,7 @@ use std::{
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
 use lexopt::prelude::*;
-use objc2::{rc::Retained, runtime::ProtocolObject, AnyThread};
+use objc2::{AnyThread, rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::*;
 use objc2_virtualization::*;
 
@@ -422,6 +424,15 @@ enum WaitResult {
     Found,
 }
 
+pub enum VmInput {
+    Bytes(Vec<u8>),
+    Shutdown,
+}
+
+enum VmOutput {
+    LoginActionTimeout { action: String, timeout: Duration },
+}
+
 #[derive(Default)]
 pub struct OutputMonitor {
     buffer: Mutex<String>,
@@ -456,11 +467,6 @@ impl OutputMonitor {
             WaitResult::Found
         }
     }
-}
-
-pub enum VmInput {
-    Bytes(Vec<u8>),
-    Shutdown,
 }
 
 fn ensure_base_image(
@@ -567,7 +573,6 @@ fn ensure_instance_disk(
 
 pub struct IoContext {
     pub input_tx: Sender<VmInput>,
-    shutdown_flag: Arc<AtomicBool>,
     wakeup_write: OwnedFd,
     stdin_thread: thread::JoinHandle<()>,
     mux_thread: thread::JoinHandle<()>,
@@ -585,60 +590,108 @@ pub fn spawn_vm_io(
     vm_input_fd: OwnedFd,
 ) -> IoContext {
     let (input_tx, input_rx): (Sender<VmInput>, Receiver<VmInput>) = mpsc::channel();
-    let shutdown_flag = Arc::new(AtomicBool::new(false));
-    let flag_clone = shutdown_flag.clone();
+
+    // raw_guard is set when we've put the user's terminal into raw mode because we've attached stdin/stdout to the VM.
+    let raw_guard = Arc::new(Mutex::new(None));
 
     let (wakeup_read, wakeup_write) = create_pipe();
 
-    // Copies from stdin to the VM; uses poll so we can break the loop and exit the thread when it's time to shutdown.
+    enum PollResult<'a> {
+        Ready(&'a [u8]),
+        Spurious,
+        Shutdown,
+        Error,
+    }
+
+    fn poll_with_wakeup<'a>(main_fd: RawFd, wakeup_fd: RawFd, buf: &'a mut [u8]) -> PollResult<'a> {
+        let mut fds = [
+            libc::pollfd {
+                fd: main_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: wakeup_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+
+        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        if ret <= 0 || fds[1].revents & libc::POLLIN != 0 {
+            PollResult::Shutdown
+        } else if fds[0].revents & libc::POLLIN != 0 {
+            let n = unsafe { libc::read(main_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n < 0 {
+                PollResult::Error
+            } else if n == 0 {
+                PollResult::Shutdown
+            } else {
+                PollResult::Ready(&buf[..(n as usize)])
+            }
+        } else {
+            PollResult::Spurious
+        }
+    }
+
+    // Copies from stdin to the VM; also polls wakeup_read to exit the thread when it's time to shutdown.
     let stdin_thread = thread::spawn({
         let input_tx = input_tx.clone();
+        let raw_guard = raw_guard.clone();
+        let wakeup_read = wakeup_read.try_clone().unwrap();
+
         move || {
-            let stdin_fd = libc::STDIN_FILENO;
-            let mut buf = [0u8; 64];
-
+            let mut buf = [0u8; 1024];
             loop {
-                let mut fds = [
-                    libc::pollfd {
-                        fd: stdin_fd,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    },
-                    libc::pollfd {
-                        fd: wakeup_read.as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    },
-                ];
-
-                let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
-                if ret <= 0 {
-                    break;
-                }
-
-                if fds[1].revents & libc::POLLIN != 0 {
-                    break;
-                }
-
-                if fds[0].revents & libc::POLLIN != 0 {
-                    let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
-                    if n <= 0 {
-                        break;
-                    }
-                    if flag_clone.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    if input_tx
-                        .send(VmInput::Bytes(buf[..n as usize].to_vec()))
-                        .is_err()
-                    {
-                        break;
+                match poll_with_wakeup(libc::STDIN_FILENO, wakeup_read.as_raw_fd(), &mut buf) {
+                    PollResult::Shutdown | PollResult::Error => break,
+                    PollResult::Spurious => continue,
+                    PollResult::Ready(bytes) => {
+                        if raw_guard.lock().unwrap().is_none() {
+                            continue;
+                        }
+                        if input_tx.send(VmInput::Bytes(bytes.to_vec())).is_err() {
+                            break;
+                        }
                     }
                 }
             }
         }
     });
 
+    // Copies VM output to stdout; also polls wakeup_read to exit the thread when it's time to shutdown.
+    let stdout_thread = thread::spawn({
+        let raw_guard = raw_guard.clone();
+        let wakeup_read = wakeup_read.try_clone().unwrap();
+
+        move || {
+            let mut stdout = std::io::stdout().lock();
+            let mut buf = [0u8; 1024];
+            loop {
+                match poll_with_wakeup(vm_output_fd.as_raw_fd(), wakeup_read.as_raw_fd(), &mut buf)
+                {
+                    PollResult::Shutdown | PollResult::Error => break,
+                    PollResult::Spurious => continue,
+                    PollResult::Ready(bytes) => {
+                        // enable raw mode, if we haven't already
+                        if raw_guard.lock().unwrap().is_none()
+                            && let Ok(guard) = enable_raw_mode(libc::STDIN_FILENO)
+                        {
+                            *raw_guard.lock().unwrap() = Some(guard);
+                        }
+
+                        if stdout.write_all(bytes).is_err() {
+                            break;
+                        }
+                        let _ = stdout.flush();
+                        output_monitor.push(bytes);
+                    }
+                }
+            }
+        }
+    });
+
+    // Copies data from mpsc channel into VM, so vibe can "type" stuff and run scripts.
     let mux_thread = thread::spawn(move || {
         let mut vm_writer = std::fs::File::from(vm_input_fd);
         loop {
@@ -654,32 +707,8 @@ pub fn spawn_vm_io(
         }
     });
 
-    let stdout_thread = thread::spawn(move || {
-        let mut vm_reader = std::fs::File::from(vm_output_fd);
-
-        let mut buf = [0u8; 1024];
-        loop {
-            match vm_reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    // TODO: Ideally, we could lock for the entire lifetime of the thread, but I'm not sure how to interrupt the thread because the virtualization framework doesn't close the file descriptor when the VM shuts down.
-                    // so we'll just leak this thread =(
-                    let mut stdout = std::io::stdout().lock();
-                    let bytes = &buf[..n];
-                    if stdout.write_all(bytes).is_err() {
-                        break;
-                    }
-                    let _ = stdout.flush();
-                    output_monitor.push(bytes);
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
     IoContext {
         input_tx,
-        shutdown_flag,
         wakeup_write,
         stdin_thread,
         mux_thread,
@@ -689,14 +718,11 @@ pub fn spawn_vm_io(
 
 impl IoContext {
     pub fn shutdown(self) {
-        self.shutdown_flag.store(true, Ordering::Relaxed);
         let _ = self.input_tx.send(VmInput::Shutdown);
         unsafe { libc::write(self.wakeup_write.as_raw_fd(), b"x".as_ptr() as *const _, 1) };
         let _ = self.stdin_thread.join();
+        let _ = self.stdout_thread.join();
         let _ = self.mux_thread.join();
-
-        // Leak this thread because I can't figure out how to interrupt it.
-        drop(self.stdout_thread);
     }
 }
 
@@ -854,18 +880,17 @@ fn spawn_login_actions_thread(
     login_actions: Vec<LoginAction>,
     output_monitor: Arc<OutputMonitor>,
     input_tx: mpsc::Sender<VmInput>,
-    trigger_exit_tx: mpsc::Sender<String>,
+    vm_output_tx: mpsc::Sender<VmOutput>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         for a in login_actions {
             match a {
                 Expect { text, timeout } => {
                     if WaitResult::Timeout == output_monitor.wait_for(&text, timeout) {
-                        let exit_msg = format!(
-                            "Login action timed out waiting for '{}' after {:?}",
-                            &text, timeout
-                        );
-                        let _ = trigger_exit_tx.send(exit_msg);
+                        let _ = vm_output_tx.send(VmOutput::LoginActionTimeout {
+                            action: format!("expect '{}'", text),
+                            timeout,
+                        });
                         return;
                     }
                 }
@@ -981,18 +1006,16 @@ fn run_vm(
         all_login_actions.push(a.clone())
     }
 
-    let (trigger_exit_tx, trigger_exit_rx) = mpsc::channel();
+    let (vm_output_tx, vm_output_rx) = mpsc::channel::<VmOutput>();
     let login_actions_thread = spawn_login_actions_thread(
         all_login_actions,
         output_monitor.clone(),
         io_ctx.input_tx.clone(),
-        trigger_exit_tx,
+        vm_output_tx,
     );
 
-    let _raw_guard = enable_raw_mode(io::stdin().as_raw_fd())?;
-
     let mut last_state = None;
-    let mut exit = Ok(());
+    let mut exit_result = Ok(());
     loop {
         unsafe {
             NSRunLoop::mainRunLoop().runMode_beforeDate(
@@ -1006,9 +1029,13 @@ fn run_vm(
             //eprintln!("[state] {:?}", state);
             last_state = Some(state);
         }
-        match trigger_exit_rx.try_recv() {
-            Ok(msg) => {
-                exit = Err(msg.into());
+        match vm_output_rx.try_recv() {
+            Ok(VmOutput::LoginActionTimeout { action, timeout }) => {
+                exit_result = Err(format!(
+                    "Login action ({}) timed out after {:?}; shutting down.",
+                    action, timeout
+                )
+                .into());
                 unsafe {
                     if vm.canRequestStop() {
                         if let Err(err) = vm.requestStopWithError() {
@@ -1034,7 +1061,7 @@ fn run_vm(
 
     io_ctx.shutdown();
 
-    exit
+    exit_result
 }
 
 fn nsurl_from_path(path: &Path) -> Result<Retained<NSURL>, Box<dyn std::error::Error>> {
