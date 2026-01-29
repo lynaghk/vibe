@@ -193,6 +193,11 @@ I'm not sure about (but open to discussing proposals via GitHub issues):
 
 - running VMs in the background
 - using SSH as a login mechanism; this would eliminate the current stdin/stdout-to-console plumbing (yay!) but require additional setup/configuration (boo!)
+- making Claude Code work seamlessly
+  - I tried the native installer but it sometimes fails during setup (see 6352d13), so I switched back to NPM via mise which is more reliable.
+  - The `~/.claude` folder is shared in the VM by default, by apparently the `~/.claude.json` file is also required for auth credentials and session history.
+    I'm not sure the best way to share a file between host and VM (virtioFS only works with folders).
+    Also: Wild to me that Anthropic puts both a file and a folder in your home directory --- how rude!
 
 I'm not interested in:
 
