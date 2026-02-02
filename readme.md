@@ -170,7 +170,7 @@ I didn't want to run agents via containers, since containers aren't security bou
 Unfortunately it requires MacOS 26 Tahoe, which wrecks [window resizing](https://news.ycombinator.com/item?id=46579864), adds [useless icons everywhere](https://news.ycombinator.com/item?id=46497712), and otherwise seems to be a mess.
 Sorry excellent Apple programmers and hardware designers, I hope your management can reign in the haute couture folks before we all have to switch to Linux for professional computing.
 
-- [QEMU](https://wiki.qemu.org/) - The first prototype of this app was a single bash script wrapping `qemu`. This worked swimmingly, except for host/guest directory sharing, which ended up being a show-stopper. This is because QEMU doesn't support [virtiofs](https://virtio-fs.gitlab.io/) on Mac hosts, it only supports "9p", which is way slower ---  e.g., `mise use node@latest` takes > 10 minutes on 9p and 5 seconds on virtiofs.
+- [QEMU](https://wiki.qemu.org/) - The first prototype of this app was [a single bash script](https://github.com/lynaghk/vibe/blob/1c82fd3b9fabf93abba2680fc856458e97a105cd/qemu.sh) wrapping `qemu`. This worked swimmingly, except for host/guest directory sharing, which ended up being a show-stopper. This is because QEMU doesn't support [virtiofs](https://virtio-fs.gitlab.io/) on Mac hosts, it only supports "9p", which is way slower ---  e.g., `mise use node@latest` takes > 10 minutes on 9p and 5 seconds on virtiofs.
 
 
 ## Roadmap / Collaboration
@@ -195,6 +195,8 @@ I wrote this software for myself, and I'm open to pull requests and otherwise co
 I'm not sure about (but open to discussing proposals via GitHub issues):
 
 - running VMs in the background
+- supporting Linux hosts
+- supporting guests beyond Debian Linux
 - using SSH as a login mechanism; this would eliminate the current stdin/stdout-to-console plumbing (yay!) but require additional setup/configuration (boo!)
 - making Claude Code work seamlessly
   - I tried the native installer but it sometimes fails during setup (see 6352d13), so I switched back to NPM via mise which is more reliable.
@@ -205,4 +207,3 @@ I'm not sure about (but open to discussing proposals via GitHub issues):
 I'm not interested in:
 
 - anything related to Docker / containers / Kubernetes / distributed systems
-- complex changes to support operating system hosts besides MacOS or guests besides Linux
