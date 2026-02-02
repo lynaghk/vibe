@@ -63,6 +63,7 @@ Download [the latest binary built by GitHub actions](https://github.com/lynaghk/
 
     curl -LO https://github.com/lynaghk/vibe/releases/download/latest/vibe-macos-arm64.zip
     unzip vibe-macos-arm64.zip
+    ./vibe # this will self-sign the binary, download the image, and launch the VM
     sudo mv vibe /usr/local/bin
 
 If you use [mise-en-place](https://mise.jdx.dev/):
