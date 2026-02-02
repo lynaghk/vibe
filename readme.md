@@ -61,12 +61,9 @@ Vibe is a single binary built with Rust.
 
 Download [the latest binary built by GitHub actions](https://github.com/lynaghk/vibe/releases/tag/latest) and put it somewhere on your `$PATH`:
 
-    curl -L -o vibe https://github.com/lynaghk/vibe/releases/download/latest/vibe
-    xattr -d com.apple.quarantine vibe
-    chmod +x vibe
+    curl -LO https://github.com/lynaghk/vibe/releases/download/latest/vibe-macos-arm64.zip
+    unzip vibe-macos-arm64.zip
     sudo mv vibe /usr/local/bin
-
-(The `xattr` command is to keep MacOS from hassling you about running a binary from someone who hasn't paid them.)
 
 If you use [mise-en-place](https://mise.jdx.dev/):
 
