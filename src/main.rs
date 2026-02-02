@@ -34,7 +34,6 @@ const DEBIAN_COMPRESSED_SIZE_BYTES: u64 = 280901576;
 const SHARED_DIRECTORIES_TAG: &str = "shared";
 
 const BYTES_PER_MB: u64 = 1024 * 1024;
-const DISK_SIZE_BYTES: u64 = 10 * 1024 * BYTES_PER_MB;
 const DEFAULT_CPU_COUNT: usize = 2;
 const DEFAULT_RAM_MB: u64 = 2048;
 const DEFAULT_RAM_BYTES: u64 = DEFAULT_RAM_MB * BYTES_PER_MB;
@@ -578,7 +577,6 @@ fn ensure_default_image(
 
     println!("Configuring base image...");
     fs::copy(base_raw, default_raw)?;
-    resize(default_raw, DISK_SIZE_BYTES)?;
 
     let provision_command = script_command_from_content("provision.sh", PROVISION_SCRIPT)?;
     run_vm(
@@ -603,7 +601,6 @@ fn ensure_instance_disk(
     println!("Creating instance disk from {}...", template_raw.display());
     std::fs::create_dir_all(instance_raw.parent().unwrap())?;
     fs::copy(template_raw, instance_raw)?;
-    resize(instance_raw, DISK_SIZE_BYTES)?;
     Ok(())
 }
 
@@ -1123,12 +1120,6 @@ fn nsurl_from_path(path: &Path) -> Result<Retained<NSURL>, Box<dyn std::error::E
             .ok_or("Non-UTF8 path encountered while building NSURL")?,
     );
     Ok(NSURL::fileURLWithPath(&ns_path))
-}
-
-fn resize(path: &Path, size_bytes: u64) -> Result<(), Box<dyn std::error::Error>> {
-    let file = fs::OpenOptions::new().write(true).open(path)?;
-    file.set_len(size_bytes)?;
-    Ok(())
 }
 
 fn enable_raw_mode(fd: i32) -> io::Result<RawModeGuard> {

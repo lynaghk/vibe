@@ -124,7 +124,7 @@ There is no centralized registry of VMs --- if you want to delete a VM, just del
 
 ## Other notes
 
-- The VM disks are 10 GB, but because Apple Filesystem is copy-on-write, disk space is only actually consumed when new data is written.
+- Apple Filesystem is copy-on-write, so instance images only use disk space when they diverge from the default image.
   You can use `du -h` to see how much space is actually consumed:
 
       $ /bin/ls -lah .vibe/instance.raw
@@ -177,6 +177,7 @@ Sorry excellent Apple programmers and hardware designers, I hope your management
 
 I wrote this software for myself, and I'm open to pull requests and otherwise collaborating on features that I'd personally use:
 
+- resizing disk images
 - forwarding ports from the host to a guest
 - running `vibe` against a disk image that's already running should connect to the already-running VM
   - the VM shouldn't shutdown until all host terminals have logged out
