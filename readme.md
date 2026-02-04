@@ -76,7 +76,7 @@ I recommend reading the commit history and pinning to a specific version.
 
 You can also install via `cargo`:
 
-    cargo install --locked --git ssh://git@github.com/lynaghk/vibe.git
+    cargo install --locked --git https://github.com/lynaghk/vibe.git
 
 If you don't have `cargo`, you need to install Rust:
 
