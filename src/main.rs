@@ -145,6 +145,8 @@ Options
   --send <some-command>                                     Type `some-command` followed by newline into the VM.
   --expect <string> [timeout-seconds]                       Wait for `string` to appear in console output before executing next `--script` or `--send`.
                                                             If `string` does not appear within timeout (default 30 seconds), shutdown VM with error.
+  --ca-cert <path/to/cert.pem>                              Install a CA certificate in the VM's trust store.
+                                                            Useful for corporate proxies. Can be specified multiple times.
 "
         );
         std::process::exit(0);
@@ -196,6 +198,7 @@ Options
             &base_compressed,
             &default_raw,
             std::slice::from_ref(&mise_directory_share),
+            &args.ca_certs,
         )?;
         ensure_instance_disk(&instance_raw, &default_raw)?;
 
@@ -261,6 +264,7 @@ Options
         &directory_shares[..],
         args.cpu_count,
         args.ram_bytes,
+        &args.ca_certs,
     )
 }
 
@@ -273,6 +277,7 @@ struct CliArgs {
     login_actions: Vec<LoginAction>,
     cpu_count: usize,
     ram_bytes: u64,
+    ca_certs: Vec<(String, String)>, // (filename, content)
 }
 
 fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
@@ -292,6 +297,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
     let mut script_index = 0;
     let mut cpu_count = DEFAULT_CPU_COUNT;
     let mut ram_bytes = DEFAULT_RAM_BYTES;
+    let mut ca_certs = Vec::new();
 
     while let Some(arg) = parser.next()? {
         match arg {
@@ -333,6 +339,19 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
                 };
                 login_actions.push(Expect { text, timeout });
             }
+            Long("ca-cert") => {
+                let path_str = os_to_string(parser.value()?, "--ca-cert")?;
+                let path = PathBuf::from(&path_str);
+                let content = fs::read_to_string(&path).map_err(|e| {
+                    format!("Failed to read CA certificate '{}': {}", path.display(), e)
+                })?;
+                let filename = path
+                    .file_name()
+                    .ok_or_else(|| format!("CA certificate path has no filename: {}", path.display()))?
+                    .to_string_lossy()
+                    .into_owned();
+                ca_certs.push((filename, content));
+            }
             Value(value) => {
                 if disk.is_some() {
                     return Err("Only one disk path may be provided".into());
@@ -352,6 +371,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         login_actions,
         cpu_count,
         ram_bytes,
+        ca_certs,
     })
 }
 
@@ -381,6 +401,64 @@ fn script_command_from_content(
         );
     }
     Ok(command)
+}
+
+/// Generates LoginActions to install CA certificates in the VM's trust store.
+/// Certificates are uploaded to /usr/local/share/ca-certificates/ and then
+/// update-ca-certificates is run to add them to the system trust store.
+fn ca_cert_install_actions(
+    ca_certs: &[(String, String)],
+) -> Result<Vec<LoginAction>, Box<dyn std::error::Error>> {
+    if ca_certs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut actions = Vec::new();
+    let marker = "VIBE_CA_CERT_EOF";
+    let ca_dir = "/usr/local/share/ca-certificates";
+
+    for (filename, content) in ca_certs {
+        // Validate heredoc marker isn't in content
+        if content.contains(marker) {
+            return Err(format!(
+                "CA certificate '{}' contains marker '{}', cannot safely upload",
+                filename, marker
+            )
+            .into());
+        }
+
+        // Sanitize filename: only allow alphanumeric, dash, underscore, and dot
+        let safe_filename: String = filename
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+
+        // Ensure .crt extension for update-ca-certificates to pick it up
+        let final_filename = if safe_filename.ends_with(".crt") {
+            safe_filename
+        } else if safe_filename.ends_with(".pem") {
+            safe_filename.replace(".pem", ".crt")
+        } else {
+            format!("{}.crt", safe_filename)
+        };
+
+        let guest_path = format!("{}/{}", ca_dir, final_filename);
+        let command = format!(
+            "cat >{guest_path} <<'{marker}'\n{content}\n{marker}"
+        );
+        actions.push(Send(command));
+    }
+
+    // Run update-ca-certificates to install all certs at once
+    actions.push(Send("update-ca-certificates".into()));
+
+    Ok(actions)
 }
 
 fn motd_login_action(directory_shares: &[DirectoryShare]) -> Option<LoginAction> {
@@ -569,6 +647,7 @@ fn ensure_default_image(
     base_compressed: &Path,
     default_raw: &Path,
     directory_shares: &[DirectoryShare],
+    ca_certs: &[(String, String)],
 ) -> Result<(), Box<dyn std::error::Error>> {
     if default_raw.exists() {
         return Ok(());
@@ -586,6 +665,7 @@ fn ensure_default_image(
         directory_shares,
         DEFAULT_CPU_COUNT,
         DEFAULT_RAM_BYTES,
+        ca_certs,
     )?;
 
     Ok(())
@@ -961,6 +1041,7 @@ fn run_vm(
     directory_shares: &[DirectoryShare],
     cpu_count: usize,
     ram_bytes: u64,
+    ca_certs: &[(String, String)],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (vm_reads_from, we_write_to) = create_pipe();
     let (we_read_from, vm_writes_to) = create_pipe();
@@ -1038,6 +1119,9 @@ fn run_vm(
         // We want sane terminal defaults like icrnl (translating carriage returns into newlines)
         Send("stty sane".to_string()),
     ];
+
+    // Install CA certs before directory mounts/provisioning so apt-get works
+    all_login_actions.extend(ca_cert_install_actions(ca_certs)?);
 
     if !directory_shares.is_empty() {
         all_login_actions.push(Send("mkdir -p /mnt/shared".into()));
