@@ -680,6 +680,7 @@ pub fn spawn_vm_io(
                     PollResult::Shutdown | PollResult::Error => break,
                     PollResult::Spurious => continue,
                     PollResult::Ready(bytes) => {
+                        // discard input if the VM hasn't booted up yielded output yet (which triggers us entering raw_mode)
                         if raw_guard.lock().unwrap().is_none() {
                             continue;
                         }
@@ -707,10 +708,11 @@ pub fn spawn_vm_io(
                     PollResult::Spurious => continue,
                     PollResult::Ready(bytes) => {
                         // enable raw mode, if we haven't already
-                        if raw_guard.lock().unwrap().is_none()
+                        let mut raw_guard_inner = raw_guard.lock().unwrap();
+                        if raw_guard_inner.is_none()
                             && let Ok(guard) = enable_raw_mode(libc::STDIN_FILENO)
                         {
-                            *raw_guard.lock().unwrap() = Some(guard);
+                            *raw_guard_inner = Some(guard);
                         }
 
                         if stdout.write_all(bytes).is_err() {
