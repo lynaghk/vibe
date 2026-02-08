@@ -53,6 +53,7 @@ cat > .config/mise/config.toml <<MISE
     node = "24.13.0"
     "npm:@openai/codex" = "latest"
     "npm:@anthropic-ai/claude-code" = "latest"
+    "npm:@google/gemini-cli" = "latest"
 MISE
 
 touch .config/mise/mise.lock
