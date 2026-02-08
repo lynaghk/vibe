@@ -34,6 +34,7 @@ const DEBIAN_COMPRESSED_SIZE_BYTES: u64 = 280901576;
 const SHARED_DIRECTORIES_TAG: &str = "shared";
 
 const BYTES_PER_MB: u64 = 1024 * 1024;
+const BYTES_PER_GB: u64 = 1024 * 1024 * 1024;
 const DEFAULT_CPU_COUNT: usize = 2;
 const DEFAULT_RAM_MB: u64 = 2048;
 const DEFAULT_RAM_BYTES: u64 = DEFAULT_RAM_MB * BYTES_PER_MB;
@@ -141,6 +142,7 @@ Options
                                                             Errors if host-path does not exist.
   --cpus <count>                                            Number of virtual CPUs (default {DEFAULT_CPU_COUNT}).
   --ram <megabytes>                                         RAM size in megabytes (default {DEFAULT_RAM_MB}).
+  --resize-disk <gigabytes>                                 Resize disk to specified size in gigabytes.
   --script <path/to/script.sh>                              Run script in VM.
   --send <some-command>                                     Type `some-command` followed by newline into the VM.
   --expect <string> [timeout-seconds]                       Wait for `string` to appear in console output before executing next `--script` or `--send`.
@@ -185,11 +187,11 @@ Options
     let mise_directory_share =
         DirectoryShare::new(guest_mise_cache, "/root/.local/share/mise".into(), false)?;
 
-    let disk_path = if let Some(path) = args.disk {
+    let (disk_path, disk_was_resized) = if let Some(path) = args.disk {
         if !path.exists() {
             return Err(format!("Disk image does not exist: {}", path.display()).into());
         }
-        path
+        (path, false)
     } else {
         ensure_default_image(
             &base_raw,
@@ -197,9 +199,9 @@ Options
             &default_raw,
             std::slice::from_ref(&mise_directory_share),
         )?;
-        ensure_instance_disk(&instance_raw, &default_raw)?;
+        let (_, resized) = ensure_instance_disk(&instance_raw, &default_raw, args.resize_disk_gb)?;
 
-        instance_raw
+        (instance_raw, resized)
     };
 
     let mut login_actions = Vec::new();
@@ -252,6 +254,17 @@ Options
         login_actions.push(motd_action);
     }
 
+    // Add disk expansion actions if disk was resized
+    if disk_was_resized {
+        login_actions.push(Send("echo 'Expanding disk partition and filesystem...'".into()));
+        // Install cloud-guest-utils if needed (provides growpart)
+        login_actions.push(Send("command -v growpart >/dev/null || apt-get update -qq && apt-get install -y -qq cloud-guest-utils".into()));
+        // Grow the partition (assuming /dev/vda1 is the root partition)
+        login_actions.push(Send("growpart /dev/vda 1 || true".into()));
+        // Resize the filesystem
+        login_actions.push(Send("resize2fs /dev/vda1".into()));
+    }
+
     // Any user-provided login actions must come after our system ones
     login_actions.extend(args.login_actions);
 
@@ -273,6 +286,7 @@ struct CliArgs {
     login_actions: Vec<LoginAction>,
     cpu_count: usize,
     ram_bytes: u64,
+    resize_disk_gb: Option<u64>,
 }
 
 fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
@@ -292,6 +306,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
     let mut script_index = 0;
     let mut cpu_count = DEFAULT_CPU_COUNT;
     let mut ram_bytes = DEFAULT_RAM_BYTES;
+    let mut resize_disk_gb = None;
 
     while let Some(arg) = parser.next()? {
         match arg {
@@ -311,6 +326,13 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
                     return Err("--ram must be >= 1".into());
                 }
                 ram_bytes = value * BYTES_PER_MB;
+            }
+            Long("resize-disk") => {
+                let value: u64 = os_to_string(parser.value()?, "--resize-disk")?.parse()?;
+                if value == 0 {
+                    return Err("--resize-disk must be >= 1".into());
+                }
+                resize_disk_gb = Some(value);
             }
             Long("mount") => {
                 mounts.push(os_to_string(parser.value()?, "--mount")?);
@@ -352,6 +374,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         login_actions,
         cpu_count,
         ram_bytes,
+        resize_disk_gb,
     })
 }
 
@@ -594,15 +617,37 @@ fn ensure_default_image(
 fn ensure_instance_disk(
     instance_raw: &Path,
     template_raw: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if instance_raw.exists() {
-        return Ok(());
+    resize_disk_gb: Option<u64>,
+) -> Result<((), bool), Box<dyn std::error::Error>> {
+    let mut disk_was_resized = false;
+
+    if !instance_raw.exists() {
+        println!("Creating instance disk from {}...", template_raw.display());
+        std::fs::create_dir_all(instance_raw.parent().unwrap())?;
+        fs::copy(template_raw, instance_raw)?;
     }
 
-    println!("Creating instance disk from {}...", template_raw.display());
-    std::fs::create_dir_all(instance_raw.parent().unwrap())?;
-    fs::copy(template_raw, instance_raw)?;
-    Ok(())
+    // Resize disk if explicitly requested
+    if let Some(disk_size_gb) = resize_disk_gb {
+        let target_size = disk_size_gb * BYTES_PER_GB;
+        let current_size = fs::metadata(instance_raw)?.len();
+
+        if target_size > current_size {
+            println!("Resizing disk to {} GB...", disk_size_gb);
+            let status = Command::new("truncate")
+                .args(["-s", &format!("{}G", disk_size_gb), &instance_raw.to_string_lossy()])
+                .status()?;
+
+            if !status.success() {
+                return Err("Failed to resize disk".into());
+            }
+            disk_was_resized = true;
+        } else if target_size < current_size {
+            return Err(format!("Cannot shrink disk from {} GB to {} GB", current_size / BYTES_PER_GB, disk_size_gb).into());
+        }
+    }
+
+    Ok(((), disk_was_resized))
 }
 
 pub struct IoContext {
