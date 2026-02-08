@@ -1033,6 +1033,9 @@ fn run_vm(
             text: "~#".to_string(),
             timeout: LOGIN_EXPECT_TIMEOUT,
         },
+        // Our terminal is connected via /dev/hvc0 which Debian apparently keeps barebones.
+        // We want sane terminal defaults like icrnl (translating carriage returns into newlines)
+        Send("stty sane".to_string()),
     ];
 
     if !directory_shares.is_empty() {
