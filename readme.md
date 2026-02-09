@@ -104,6 +104,8 @@ Options
   --send <some-command>                                     Type `some-command` followed by newline into the VM.
   --expect <string> [timeout-seconds]                       Wait for `string` to appear in console output before executing next `--script` or `--send`.
                                                             If `string` does not appear within timeout (default 30 seconds), shutdown VM with error.
+  --ca-cert <path/to/cert.pem>                              Install a CA certificate in the VM's trust store.
+                                                            Useful for corporate proxies. Can be specified multiple times.
 ```
 
 Invoking vibe without a disk image:
