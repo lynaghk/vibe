@@ -256,13 +256,14 @@ Options
 
     // Add disk expansion actions if disk was resized
     if disk_was_resized {
-        login_actions.push(Send("echo 'Expanding disk partition and filesystem...'".into()));
-        // Install cloud-guest-utils if needed (provides growpart)
-        login_actions.push(Send("command -v growpart >/dev/null || apt-get update -qq && apt-get install -y -qq cloud-guest-utils".into()));
-        // Grow the partition (assuming /dev/vda1 is the root partition)
-        login_actions.push(Send("growpart /dev/vda 1 || true".into()));
-        // Resize the filesystem
-        login_actions.push(Send("resize2fs /dev/vda1".into()));
+        // Combine all disk resize operations into a single command to ensure they run sequentially
+        login_actions.push(Send(
+            "echo 'Expanding disk partition and filesystem...' && \
+             (command -v growpart >/dev/null || (apt-get update -qq && apt-get install -y -qq cloud-guest-utils)) && \
+             growpart /dev/vda 1 && \
+             resize2fs /dev/vda1 && \
+             echo 'Disk resize complete.'".into()
+        ));
     }
 
     // Any user-provided login actions must come after our system ones
