@@ -800,12 +800,12 @@ fn create_vm_configuration(
         // Disks
         {
             let disk_attachment = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_cachingMode_synchronizationMode_error(
-            VZDiskImageStorageDeviceAttachment::alloc(),
-            &nsurl_from_path(disk_path).unwrap(),
-            false,
-            VZDiskImageCachingMode::Automatic,
-            VZDiskImageSynchronizationMode::Full,
-        ).unwrap();
+                VZDiskImageStorageDeviceAttachment::alloc(),
+                &nsurl_from_path(disk_path).unwrap(),
+                false,
+                VZDiskImageCachingMode::Cached,
+                VZDiskImageSynchronizationMode::Full,
+            ).unwrap();
 
             let disk_device = VZVirtioBlockDeviceConfiguration::initWithAttachment(
                 VZVirtioBlockDeviceConfiguration::alloc(),
