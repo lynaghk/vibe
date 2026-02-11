@@ -125,14 +125,17 @@ There is no centralized registry of VMs --- if you want to delete a VM, just del
 
 ## Other notes
 
-- Apple Filesystem is copy-on-write, so instance images only use disk space when they diverge from the default image.
+- The default VM disk is 20 GiB, but only uses about 2.5 GiB.
+  Since Apple Filesystem is copy-on-write and doesn't count zeros, disk space is only used when you actually write new blocks.
   You can use `du -h` to see how much space is actually consumed:
-
-      $ /bin/ls -lah .vibe/instance.raw
-      -rw-r--r--  1 dev  staff    10G Jan 25 20:41 .vibe/instance.raw
+      
+      $ ls -lah .vibe/instance.raw
+      -rw-r--r--  1 dev  staff    20G Feb 11 21:57 .vibe/instance.raw
 
       $ du -h .vibe/instance.raw
-      2.3G    .vibe/instance.raw
+      2.5G    .vibe/instance.raw
+
+  If you need even more space within the VM, e.g., 100 GiB, run `truncate -s 100G .vibe/instance.raw` on your Mac and then within the VM run `growpart /dev/vda 1 && resize2fs /dev/vda1`.
 
 - MacOS only lets binaries signed with the `com.apple.security.virtualization` entitlement run virtual machines, so `vibe` checks itself on startup and, if necessary, signs itself using `codesign`. SeCuRiTy!
 

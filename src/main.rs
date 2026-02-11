@@ -579,6 +579,12 @@ fn ensure_default_image(
     println!("Configuring base image...");
     fs::copy(base_raw, default_raw)?;
 
+    fs::OpenOptions::new()
+        .write(true)
+        .open(default_raw)?
+        // resize to 20GiB
+        .set_len(20 * 1024 * BYTES_PER_MB)?;
+
     let provision_command = script_command_from_content("provision.sh", PROVISION_SCRIPT)?;
     run_vm(
         default_raw,

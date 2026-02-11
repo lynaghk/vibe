@@ -8,6 +8,7 @@ echo 'Acquire::Retries "2";' | tee -a /etc/apt/apt.conf.d/99timeout
 
 apt-get update
 apt-get install -y --no-install-recommends      \
+        cloud-guest-utils                       \
         build-essential                         \
         pkg-config                              \
         libssl-dev                              \
@@ -15,13 +16,20 @@ apt-get install -y --no-install-recommends      \
         git                                     \
         ripgrep
 
-# Set hostname to "vibe" so it's clear that you're inside the VM.
+
+# Expand disk partition
+growpart /dev/vda 1
+
+# Expand filesystem
+resize2fs /dev/vda1
+
+# Set hostname to vibe" so it's clear that you're inside the VM.
 hostnamectl set-hostname vibe
 
 # Set this env var so claude doesn't complain about running as root.'
 echo "export IS_SANDBOX=1" >> .bashrc
 
-# Shutdown the VM when you logout 
+# Shutdown the VM when you logout
 cat > .bash_logout <<EOF
 systemctl poweroff
 sleep 100 # sleep here so that we don't see the login screen flash up before the shutdown.
