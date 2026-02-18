@@ -8,7 +8,7 @@ on:
     branches: [main]
 
 jobs:
-  build:
+  build-macos:
     runs-on: macos-latest
 
     steps:
@@ -31,12 +31,69 @@ jobs:
           cd target/release
           zip vibe-macos-arm64.zip vibe
 
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vibe-macos-arm64
+          path: target/release/vibe-macos-arm64.zip
+
+  build-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Set short git commit SHA
+        run: |
+          echo "SHA_SHORT=$(git rev-parse --short ${{ github.sha }})" >> $GITHUB_ENV
+          echo "BUILD_DATE=$(date +'%Y-%m-%d')"                       >> $GITHUB_ENV
+
+      - name: Package binary
+        run: |
+          cd target/release
+          zip vibe-linux-x86_64.zip vibe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vibe-linux-x86_64
+          path: target/release/vibe-linux-x86_64.zip
+
+  release:
+    needs: [build-macos, build-linux]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set release metadata
+        run: |
+          echo "SHA_SHORT=$(git rev-parse --short ${{ github.sha }})" >> $GITHUB_ENV
+          echo "BUILD_DATE=$(date +'%Y-%m-%d')"                       >> $GITHUB_ENV
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: vibe-macos-arm64
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: vibe-linux-x86_64
+
       - name: Create sha release
         run: |
           gh release create "${{ env.BUILD_DATE }}-${{ env.SHA_SHORT }}" \
             --title "${{ env.BUILD_DATE }}-${{ env.SHA_SHORT }}" \
             --notes "Built from commit ${{ github.sha }}" \
-            target/release/vibe-macos-arm64.zip
+            vibe-macos-arm64.zip \
+            vibe-linux-x86_64.zip
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -51,6 +108,7 @@ jobs:
             --title "Latest" \
             --notes "Built from commit ${{ github.sha }}" \
             --prerelease \
-            target/release/vibe-macos-arm64.zip
+            vibe-macos-arm64.zip \
+            vibe-linux-x86_64.zip
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

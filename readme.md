@@ -1,4 +1,5 @@
-Vibe is a quick, zero-configuration way to spin up a Linux virtual machine on Mac to sandbox LLM agents:
+Vibe is a quick, zero-configuration way to spin up a Linux virtual machine to sandbox LLM agents.
+Runs on ARM-based Macs (via Apple Virtualization) and Linux hosts (via cloud-hypervisor microVMs):
 
 ```
 $ cd my-project
@@ -30,9 +31,63 @@ On my M1 MacBook Air it takes ~10 seconds to boot.
 
 Dependencies:
 
+**macOS (ARM)**
 - An ARM-based Mac running MacOS 13 (Ventura) or higher.
 - A network connection is required on the first run to download and configure the Debian Linux base image.
 - That's it!
+
+**Linux (x86\_64 or aarch64)**
+
+Vibe supports two VM backends on Linux: **QEMU** (simpler setup) and **cloud-hypervisor** (faster boot, ~1s vs ~3-5s). It auto-detects whichever is available, preferring cloud-hypervisor when both are installed.
+
+**QEMU (recommended for quick setup)**
+
+    sudo apt install qemu-system-x86 ovmf
+
+    # Allow your user to access KVM
+    sudo usermod -aG kvm $USER && newgrp kvm
+
+`virtiofsd` is also required. On Ubuntu 23.10+, it's in apt:
+
+    sudo apt install virtiofsd
+
+On Ubuntu 22.04 / other older distros, install it via cargo:
+
+    cargo install virtiofsd
+
+That's it. QEMU uses standard OVMF firmware and user-mode networking — no extra downloads or capability grants needed.
+
+**cloud-hypervisor (faster boot)**
+
+On Ubuntu 24.04 or later:
+
+    sudo apt install cloud-hypervisor virtiofsd ovmf
+
+On Ubuntu 22.04 / other distros without `cloud-hypervisor` in apt, install the binaries manually and download the cloud-hypervisor-specific EFI firmware (`CLOUDHV.fd`; the standard `ovmf` package won't work):
+
+    # Download cloud-hypervisor and virtiofsd
+    curl -L -o ~/.local/bin/cloud-hypervisor https://github.com/cloud-hypervisor/cloud-hypervisor/releases/latest/download/cloud-hypervisor-static
+    curl -L -o ~/.local/bin/virtiofsd https://gitlab.com/virtio-fs/virtiofsd/-/releases/permalink/latest/downloads/virtiofsd-x86_64
+    chmod +x ~/.local/bin/cloud-hypervisor ~/.local/bin/virtiofsd
+
+    # Download CLOUDHV.fd firmware (cloud-hypervisor requires its own EFI build)
+    mkdir -p ~/.local/share/cloud-hypervisor
+    curl -L -o ~/.local/share/cloud-hypervisor/CLOUDHV.fd \
+      https://github.com/cloud-hypervisor/edk2/releases/latest/download/CLOUDHV.fd
+
+Then do two one-time permission grants so vibe can use KVM and create TAP network interfaces without running as root:
+
+    # Allow your user to access KVM
+    sudo usermod -aG kvm $USER
+
+    # Allow cloud-hypervisor to create TAP network interfaces
+    sudo setcap cap_net_admin+ep $(which cloud-hypervisor)
+
+Then start a new shell (or run `newgrp kvm`) for the group change to take effect.
+
+When both backends are installed, use `--backend <ch|qemu>` to select one explicitly.
+
+A network connection is required on the first run to download and configure the Debian Linux base image.
 
 
 ## Why use Vibe?
@@ -60,10 +115,20 @@ Finally, as a matter of taste and style:
 
 Vibe is a single binary built with Rust.
 
-Download [the latest binary built by GitHub actions](https://github.com/lynaghk/vibe/releases/tag/latest) and put it somewhere on your `$PATH`:
+Download [the latest binary built by GitHub actions](https://github.com/lynaghk/vibe/releases/tag/latest) and put it somewhere on your `$PATH`.
+
+**macOS (ARM):**
 
     curl -LO https://github.com/lynaghk/vibe/releases/download/latest/vibe-macos-arm64.zip
     unzip vibe-macos-arm64.zip
+    mkdir -p ~/.local/bin
+    mv vibe ~/.local/bin
+    export PATH="$HOME/.local/bin:$PATH"
+
+**Linux (x86\_64):**
+
+    curl -LO https://github.com/lynaghk/vibe/releases/download/latest/vibe-linux-x86_64.zip
+    unzip vibe-linux-x86_64.zip
     mkdir -p ~/.local/bin
     mv vibe ~/.local/bin
     export PATH="$HOME/.local/bin:$PATH"
