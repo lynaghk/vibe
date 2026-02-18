@@ -264,7 +264,7 @@ pub fn run_vm(
     ch_cmd.args([
         "--firmware",   &firmware.to_string_lossy(),
         "--disk",       &format!("path={}", disk_path.to_string_lossy()),
-        "--memory",     &format!("size={}M", ram_mb),
+        "--memory",     &format!("size={}M,shared=on", ram_mb),
         "--cpus",       &format!("boot={}", cpu_count),
         "--net",        "tap=,mac=,ip=,mask=",
         "--serial",     "pty",
