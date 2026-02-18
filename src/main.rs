@@ -13,7 +13,14 @@ use io::LoginAction::Send;
 use share::{DirectoryShare, motd_login_action};
 use vm::run_vm;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_cli()?;
 
     if args.version {
