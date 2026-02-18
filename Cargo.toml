@@ -8,8 +8,8 @@ libc = "*"
 lexopt = "0.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "*"
-objc2-foundation = { version = "*", features = [
+objc2 = "0.6.3"
+objc2-foundation = { version = "0.3.2", features = [
     "NSArray",
     "NSString",
     "NSURL",
@@ -20,6 +20,6 @@ objc2-foundation = { version = "*", features = [
     "NSRunLoop",
     "NSObject",
 ] }
-objc2-virtualization = "*"
-block2 = "*"
-dispatch2 = "*"
+objc2-virtualization = "0.3.2"
+block2 = "0.6.2"
+dispatch2 = "0.3.0"

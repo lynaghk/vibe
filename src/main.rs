@@ -31,7 +31,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.help {
-        let mut help = format!(
+        let help = format!(
             "Vibe is a quick way to spin up a Linux virtual machine to sandbox LLM agents.
 
 vibe [OPTIONS] [disk-image.raw]
