@@ -42,9 +42,10 @@ curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --component "rust
 
 # Install Mise
 curl https://mise.run | sh
+echo 'export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"' >> .bashrc
 echo 'eval "$(~/.local/bin/mise activate bash)"' >> .bashrc
 
-export PATH="$HOME/.local/bin:$PATH"
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
 eval "$(mise activate bash)"
 
 mkdir -p .config/mise/
