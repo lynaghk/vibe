@@ -153,7 +153,9 @@ fn wait_for_serial_pty(api_socket: &Path) -> Result<PathBuf, Box<dyn std::error:
         };
 
         if let Some(path) = extract_pty_path(&body) {
-            return Ok(path);
+            if path.exists() {
+                return Ok(path);
+            }
         }
     }
 }
