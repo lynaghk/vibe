@@ -10,6 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use libc;
+
 use crate::{
     disk::BYTES_PER_MB,
     io::{
@@ -40,6 +42,36 @@ fn find_efi_firmware() -> Option<PathBuf> {
         "/usr/share/edk2/aarch64/QEMU_EFI.fd",
     ];
     candidates.iter().map(PathBuf::from).find(|p| p.exists())
+}
+
+// ── Preflight ────────────────────────────────────────────────────────────────
+
+fn check_kvm() -> Result<(), Box<dyn std::error::Error>> {
+    let kvm = std::path::Path::new("/dev/kvm");
+
+    if !kvm.exists() {
+        return Err(
+            "KVM device /dev/kvm not found.\n\
+             Make sure the kvm kernel module is loaded: sudo modprobe kvm\n\
+             On Intel: sudo modprobe kvm_intel\n\
+             On AMD:   sudo modprobe kvm_amd"
+                .into(),
+        );
+    }
+
+    // Check read+write access via access(2) — cheaper than opening the device.
+    let ok = unsafe { libc::access(c"/dev/kvm".as_ptr(), libc::R_OK | libc::W_OK) } == 0;
+    if !ok {
+        let username = env::var("USER").unwrap_or_else(|_| "your user".into());
+        return Err(format!(
+            "Permission denied on /dev/kvm.\n\
+             Add {username} to the kvm group, then start a new shell:\n\
+             \n  sudo usermod -aG kvm {username}\n  newgrp kvm"
+        )
+        .into());
+    }
+
+    Ok(())
 }
 
 // ── cloud-hypervisor REST API (raw HTTP/1.1 over Unix socket) ─────────────────
@@ -135,6 +167,10 @@ pub fn run_vm(
     cpu_count: usize,
     ram_bytes: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // ── Preflight checks ─────────────────────────────────────────────────────
+
+    check_kvm()?;
+
     // ── Locate required binaries ──────────────────────────────────────────────
 
     let ch_bin = find_binary("cloud-hypervisor").ok_or(
