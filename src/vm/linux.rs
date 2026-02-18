@@ -25,32 +25,7 @@ const LOGIN_EXPECT_TIMEOUT: Duration = Duration::from_secs(120);
 // ── Binary / firmware discovery ───────────────────────────────────────────────
 
 fn find_binary(name: &str) -> Option<PathBuf> {
-    // Check PATH first
-    if let Ok(path_var) = env::var("PATH") {
-        for dir in path_var.split(':') {
-            let candidate = PathBuf::from(dir).join(name);
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-    // Common fallback locations not always in PATH
-    let mut fallbacks = vec![
-        "/usr/bin".into(),
-        "/usr/local/bin".into(),
-        "/opt/cloud-hypervisor".into(),
-    ];
-    if let Ok(home) = env::var("HOME") {
-        fallbacks.push(format!("{home}/.cargo/bin"));
-        fallbacks.push(format!("{home}/.local/bin"));
-    }
-    for prefix in fallbacks {
-        let candidate = PathBuf::from(&prefix).join(name);
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-    None
+    env::var("PATH").ok()?.split(':').map(|dir| PathBuf::from(dir).join(name)).find(|p| p.exists())
 }
 
 fn find_efi_firmware() -> Option<PathBuf> {
@@ -163,16 +138,18 @@ pub fn run_vm(
     // ── Locate required binaries ──────────────────────────────────────────────
 
     let ch_bin = find_binary("cloud-hypervisor").ok_or(
-        "cloud-hypervisor not found.\n\
+        "cloud-hypervisor not found in PATH.\n\
          Install: sudo apt install cloud-hypervisor\n\
-         Or see: https://github.com/cloud-hypervisor/cloud-hypervisor/releases",
+         Or download from: https://github.com/cloud-hypervisor/cloud-hypervisor/releases\n\
+         Then ensure it is in your PATH.",
     )?;
 
     let virtiofsd_bin = if !directory_shares.is_empty() {
         Some(find_binary("virtiofsd").ok_or(
-            "virtiofsd not found.\n\
-             Install: sudo apt install virtiofsd\n\
-             Or see: https://gitlab.com/virtio-fs/virtiofsd",
+            "virtiofsd not found in PATH.\n\
+             Install: sudo apt install virtiofsd  (Ubuntu 23.10+)\n\
+             Or via cargo: cargo install virtiofsd  (then add ~/.cargo/bin to PATH)\n\
+             Or download from: https://gitlab.com/virtio-fs/virtiofsd/-/releases",
         )?)
     } else {
         None
@@ -180,8 +157,8 @@ pub fn run_vm(
 
     let firmware = find_efi_firmware().ok_or(
         "EFI firmware not found.\n\
-         Install: sudo apt install cloud-hypervisor\n\
-         Or: sudo apt install ovmf",
+         Install: sudo apt install ovmf  (x86_64) or sudo apt install qemu-efi-aarch64  (aarch64)\n\
+         Or: sudo apt install cloud-hypervisor  (includes CLOUDHV.fd on some distros)",
     )?;
 
     // ── Per-session temp directory ────────────────────────────────────────────
