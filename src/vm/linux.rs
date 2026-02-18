@@ -272,16 +272,17 @@ pub fn run_vm(
         "--api-socket", &api_socket.to_string_lossy(),
     ]);
 
-    for share in directory_shares {
-        let socket_path = tmp_dir.join(format!("{}.sock", share.tag()));
-        ch_cmd.args([
-            "--fs",
-            &format!(
+    // All fs values follow a single --fs flag (cloud-hypervisor v40+ variadic syntax)
+    if !directory_shares.is_empty() {
+        ch_cmd.arg("--fs");
+        for share in directory_shares {
+            let socket_path = tmp_dir.join(format!("{}.sock", share.tag()));
+            ch_cmd.arg(format!(
                 "tag={},socket={},num_queues=1,queue_size=1024",
                 share.tag(),
                 socket_path.to_string_lossy()
-            ),
-        ]);
+            ));
+        }
     }
 
     let mut ch_process = ch_cmd
