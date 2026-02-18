@@ -14,7 +14,7 @@ use std::{
 
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
-use objc2::{rc::Retained, runtime::ProtocolObject};
+use objc2::{AnyThread, rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::*;
 use objc2_virtualization::*;
 
