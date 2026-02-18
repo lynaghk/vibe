@@ -25,6 +25,7 @@ const LOGIN_EXPECT_TIMEOUT: Duration = Duration::from_secs(120);
 // ── Binary / firmware discovery ───────────────────────────────────────────────
 
 fn find_binary(name: &str) -> Option<PathBuf> {
+    // Check PATH first
     if let Ok(path_var) = env::var("PATH") {
         for dir in path_var.split(':') {
             let candidate = PathBuf::from(dir).join(name);
@@ -33,8 +34,18 @@ fn find_binary(name: &str) -> Option<PathBuf> {
             }
         }
     }
-    for prefix in ["/usr/bin", "/usr/local/bin", "/opt/cloud-hypervisor"] {
-        let candidate = PathBuf::from(prefix).join(name);
+    // Common fallback locations not always in PATH
+    let mut fallbacks = vec![
+        "/usr/bin".into(),
+        "/usr/local/bin".into(),
+        "/opt/cloud-hypervisor".into(),
+    ];
+    if let Ok(home) = env::var("HOME") {
+        fallbacks.push(format!("{home}/.cargo/bin"));
+        fallbacks.push(format!("{home}/.local/bin"));
+    }
+    for prefix in fallbacks {
+        let candidate = PathBuf::from(&prefix).join(name);
         if candidate.exists() {
             return Some(candidate);
         }
