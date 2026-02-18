@@ -1,4 +1,5 @@
-Vibe is a quick, zero-configuration way to spin up a Linux virtual machine on Mac to sandbox LLM agents:
+Vibe is a quick, zero-configuration way to spin up a Linux virtual machine to sandbox LLM agents.
+Runs on ARM-based Macs (via Apple Virtualization) and Linux hosts (via cloud-hypervisor microVMs):
 
 ```
 $ cd my-project
@@ -30,9 +31,21 @@ On my M1 MacBook Air it takes ~10 seconds to boot.
 
 Dependencies:
 
+**macOS (ARM)**
 - An ARM-based Mac running MacOS 13 (Ventura) or higher.
 - A network connection is required on the first run to download and configure the Debian Linux base image.
 - That's it!
+
+**Linux (x86\_64 or aarch64)**
+- KVM-capable kernel (most distributions have this by default).
+- [cloud-hypervisor](https://github.com/cloud-hypervisor/cloud-hypervisor) in your `$PATH`.
+- [virtiofsd](https://gitlab.com/virtio-fs/virtiofsd) in your `$PATH` (required for directory sharing).
+- EFI firmware: install `cloud-hypervisor` or `ovmf` package from your distro.
+- A network connection is required on the first run to download and configure the Debian Linux base image.
+
+On Ubuntu/Debian:
+
+    sudo apt install cloud-hypervisor virtiofsd ovmf
 
 
 ## Why use Vibe?
@@ -60,10 +73,20 @@ Finally, as a matter of taste and style:
 
 Vibe is a single binary built with Rust.
 
-Download [the latest binary built by GitHub actions](https://github.com/lynaghk/vibe/releases/tag/latest) and put it somewhere on your `$PATH`:
+Download [the latest binary built by GitHub actions](https://github.com/lynaghk/vibe/releases/tag/latest) and put it somewhere on your `$PATH`.
+
+**macOS (ARM):**
 
     curl -LO https://github.com/lynaghk/vibe/releases/download/latest/vibe-macos-arm64.zip
     unzip vibe-macos-arm64.zip
+    mkdir -p ~/.local/bin
+    mv vibe ~/.local/bin
+    export PATH="$HOME/.local/bin:$PATH"
+
+**Linux (x86\_64):**
+
+    curl -LO https://github.com/lynaghk/vibe/releases/download/latest/vibe-linux-x86_64.zip
+    unzip vibe-linux-x86_64.zip
     mkdir -p ~/.local/bin
     mv vibe ~/.local/bin
     export PATH="$HOME/.local/bin:$PATH"

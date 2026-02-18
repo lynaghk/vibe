@@ -6,9 +6,8 @@ use std::{
     os::{
         fd::RawFd,
         unix::{
-            io::{AsRawFd, IntoRawFd, OwnedFd},
+            io::{AsRawFd, OwnedFd},
             net::UnixStream,
-            process::CommandExt,
         },
     },
     path::{Path, PathBuf},
@@ -21,16 +20,44 @@ use std::{
     time::{Duration, Instant},
 };
 
-use block2::RcBlock;
-use dispatch2::DispatchQueue;
-use lexopt::prelude::*;
-use objc2::{AnyThread, rc::Retained, runtime::ProtocolObject};
-use objc2_foundation::*;
-use objc2_virtualization::*;
+#[cfg(target_os = "macos")]
+use std::os::unix::{io::IntoRawFd, process::CommandExt};
 
+#[cfg(target_os = "macos")]
+use {
+    block2::RcBlock,
+    dispatch2::DispatchQueue,
+    objc2::{AnyThread, rc::Retained, runtime::ProtocolObject},
+    objc2_foundation::*,
+    objc2_virtualization::*,
+};
+
+use lexopt::prelude::*;
+
+// ── Disk image constants ──────────────────────────────────────────────────────
+
+#[cfg(target_os = "macos")]
 const DEBIAN_COMPRESSED_DISK_URL: &str = "https://cloud.debian.org/images/cloud/trixie/20260112-2355/debian-13-nocloud-arm64-20260112-2355.tar.xz";
+#[cfg(target_os = "macos")]
 const DEBIAN_COMPRESSED_SHA: &str = "6ab9be9e6834adc975268367f2f0235251671184345c34ee13031749fdfbf66fe4c3aafd949a2d98550426090e9ac645e79009c51eb0eefc984c15786570bb38";
-const DEBIAN_COMPRESSED_SIZE_BYTES: u64 = 280901576;
+#[cfg(target_os = "macos")]
+const DEBIAN_COMPRESSED_SIZE_BYTES: u64 = 280_901_576;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const DEBIAN_COMPRESSED_DISK_URL: &str = "https://cloud.debian.org/images/cloud/trixie/20260112-2355/debian-13-nocloud-amd64-20260112-2355.tar.xz";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const DEBIAN_COMPRESSED_SHA: &str = "765890bb31a071be829a64d086923447476b94b9c02faecff80f787a7e261f2088449f94ce362e5cb752901b188c443a284cb91bc98991fdcf375beca4a54eb9";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const DEBIAN_COMPRESSED_SIZE_BYTES: u64 = 285_000_000;
+
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const DEBIAN_COMPRESSED_DISK_URL: &str = "https://cloud.debian.org/images/cloud/trixie/20260112-2355/debian-13-nocloud-arm64-20260112-2355.tar.xz";
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const DEBIAN_COMPRESSED_SHA: &str = "6ab9be9e6834adc975268367f2f0235251671184345c34ee13031749fdfbf66fe4c3aafd949a2d98550426090e9ac645e79009c51eb0eefc984c15786570bb38";
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const DEBIAN_COMPRESSED_SIZE_BYTES: u64 = 280_901_576;
+
+#[cfg(target_os = "macos")]
 const SHARED_DIRECTORIES_TAG: &str = "shared";
 
 const BYTES_PER_MB: u64 = 1024 * 1024;
@@ -127,7 +154,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.help {
         println!(
-            "Vibe is a quick way to spin up a Linux virtual machine on Mac to sandbox LLM agents.
+            "Vibe is a quick way to spin up a Linux virtual machine to sandbox LLM agents.
 
 vibe [OPTIONS] [disk-image.raw]
 
@@ -150,6 +177,7 @@ Options
         std::process::exit(0);
     }
 
+    #[cfg(target_os = "macos")]
     ensure_signed();
 
     let project_root = env::current_dir()?;
@@ -209,8 +237,6 @@ Options
         login_actions.push(Send(format!("cd {project_name}")));
 
         // Discourage read/write of project dir subfolders within the VM.
-        // Note that this isn't secure, since the VM runs as root and could unmount this.
-        // I couldn't find an alternative way to do this --- the MacOS sandbox doesn't apply to the Apple Virtualization system =(
         for subfolder in [".git", ".vibe"] {
             if project_root.join(subfolder).exists() {
                 login_actions.push(Send(format!(r"mount -t tmpfs tmpfs {}", subfolder)))
@@ -417,12 +443,12 @@ fn motd_login_action(directory_shares: &[DirectoryShare]) -> Option<LoginAction>
     let mut output = String::new();
     output.push_str(
         "
-░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░▒▓███████▓▒░░▒▓████████▓▒░ 
-░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░        
- ░▒▓█▓▒▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░        
- ░▒▓█▓▒▒▓█▓▒░░▒▓█▓▒░▒▓███████▓▒░░▒▓██████▓▒░   
-  ░▒▓█▓▓█▓▒░ ░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░        
-  ░▒▓█▓▓█▓▒░ ░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░        
+░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░▒▓███████▓▒░░▒▓████████▓▒░
+░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░
+ ░▒▓█▓▒▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░
+ ░▒▓█▓▒▒▓█▓▒░░▒▓█▓▒░▒▓███████▓▒░░▒▓██████▓▒░
+  ░▒▓█▓▓█▓▒░ ░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░
+  ░▒▓█▓▓█▓▒░ ░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░
    ░▒▓██▓▒░  ░▒▓█▓▒░▒▓███████▓▒░░▒▓████████▓▒░
 
 ",
@@ -502,6 +528,50 @@ impl OutputMonitor {
     }
 }
 
+fn verify_sha512(file_path: &Path, expected_sha: &str) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "macos")]
+    {
+        let input = format!("{}  {}\n", expected_sha, file_path.display());
+        let mut child = Command::new("/usr/bin/shasum")
+            .args(["--algorithm", "512", "--check"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn shasum");
+        child
+            .stdin
+            .take()
+            .expect("failed to open stdin")
+            .write_all(input.as_bytes())
+            .expect("failed to write to stdin");
+        let status = child.wait().expect("failed to wait on child");
+        if !status.success() {
+            return Err(format!("SHA validation failed for {}", file_path.display()).into());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let input = format!("{}  {}\n", expected_sha, file_path.display());
+        let mut child = Command::new("sha512sum")
+            .args(["--check"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("failed to spawn sha512sum: {e}"))?;
+        child
+            .stdin
+            .take()
+            .expect("failed to open stdin")
+            .write_all(input.as_bytes())
+            .expect("failed to write to stdin");
+        let status = child.wait().expect("failed to wait on child");
+        if !status.success() {
+            return Err(format!("SHA validation failed for {}", file_path.display()).into());
+        }
+    }
+
+    Ok(())
+}
+
 fn ensure_base_image(
     base_raw: &Path,
     base_compressed: &Path,
@@ -531,28 +601,7 @@ fn ensure_base_image(
         }
     }
 
-    // Check SHA
-    {
-        let input = format!("{}  {}\n", DEBIAN_COMPRESSED_SHA, base_compressed.display());
-
-        let mut child = Command::new("/usr/bin/shasum")
-            .args(["--algorithm", "512", "--check"])
-            .stdin(Stdio::piped())
-            .spawn()
-            .expect("failed to spawn shasum");
-
-        child
-            .stdin
-            .take()
-            .expect("failed to open stdin")
-            .write_all(input.as_bytes())
-            .expect("failed to write to stdin");
-
-        let status = child.wait().expect("failed to wait on child");
-        if !status.success() {
-            return Err(format!("SHA validation failed for {DEBIAN_COMPRESSED_DISK_URL}").into());
-        }
-    }
+    verify_sha512(base_compressed, DEBIAN_COMPRESSED_SHA)?;
 
     println!("Decompressing base image...");
     let status = Command::new("tar")
@@ -773,6 +822,84 @@ impl IoContext {
     }
 }
 
+fn spawn_login_actions_thread(
+    login_actions: Vec<LoginAction>,
+    output_monitor: Arc<OutputMonitor>,
+    input_tx: mpsc::Sender<VmInput>,
+    vm_output_tx: mpsc::Sender<VmOutput>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        for a in login_actions {
+            match a {
+                Expect { text, timeout } => {
+                    if WaitResult::Timeout == output_monitor.wait_for(&text, timeout) {
+                        let _ = vm_output_tx.send(VmOutput::LoginActionTimeout {
+                            action: format!("expect '{}'", text),
+                            timeout,
+                        });
+                        return;
+                    }
+                }
+                Send(mut text) => {
+                    text.push('\n'); // Type the newline so the command is actually submitted.
+                    input_tx.send(VmInput::Bytes(text.into_bytes())).unwrap();
+                }
+                Script { path, index } => {
+                    let command = match script_command_from_path(&path, index) {
+                        Ok(command) => command,
+                        Err(err) => {
+                            eprintln!("{err}");
+                            return;
+                        }
+                    };
+                    let mut text = command;
+                    text.push('\n');
+                    input_tx.send(VmInput::Bytes(text.into_bytes())).unwrap();
+                }
+            }
+        }
+    })
+}
+
+fn enable_raw_mode(fd: i32) -> io::Result<RawModeGuard> {
+    let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
+
+    if unsafe { libc::tcgetattr(fd, &mut attributes) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let original = attributes;
+
+    // Disable translation of carriage return to newline on input
+    attributes.c_iflag &= !(libc::ICRNL);
+    // Disable canonical mode (line buffering), echo, and signal generation
+    attributes.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
+    attributes.c_cc[libc::VMIN] = 0;
+    attributes.c_cc[libc::VTIME] = 1;
+
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &attributes) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(RawModeGuard { fd, original })
+}
+
+struct RawModeGuard {
+    fd: i32,
+    original: libc::termios,
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+        }
+    }
+}
+
+// ── macOS backend ─────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "macos")]
 fn create_vm_configuration(
     disk_path: &Path,
     directory_shares: &[DirectoryShare],
@@ -910,6 +1037,7 @@ fn create_vm_configuration(
     }
 }
 
+#[cfg(target_os = "macos")]
 fn load_efi_variable_store() -> Result<Retained<VZEFIVariableStore>, Box<dyn std::error::Error>> {
     unsafe {
         let temp_dir = std::env::temp_dir();
@@ -925,45 +1053,7 @@ fn load_efi_variable_store() -> Result<Retained<VZEFIVariableStore>, Box<dyn std
     }
 }
 
-fn spawn_login_actions_thread(
-    login_actions: Vec<LoginAction>,
-    output_monitor: Arc<OutputMonitor>,
-    input_tx: mpsc::Sender<VmInput>,
-    vm_output_tx: mpsc::Sender<VmOutput>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        for a in login_actions {
-            match a {
-                Expect { text, timeout } => {
-                    if WaitResult::Timeout == output_monitor.wait_for(&text, timeout) {
-                        let _ = vm_output_tx.send(VmOutput::LoginActionTimeout {
-                            action: format!("expect '{}'", text),
-                            timeout,
-                        });
-                        return;
-                    }
-                }
-                Send(mut text) => {
-                    text.push('\n'); // Type the newline so the command is actually submitted.
-                    input_tx.send(VmInput::Bytes(text.into_bytes())).unwrap();
-                }
-                Script { path, index } => {
-                    let command = match script_command_from_path(&path, index) {
-                        Ok(command) => command,
-                        Err(err) => {
-                            eprintln!("{err}");
-                            return;
-                        }
-                    };
-                    let mut text = command;
-                    text.push('\n');
-                    input_tx.send(VmInput::Bytes(text.into_bytes())).unwrap();
-                }
-            }
-        }
-    })
-}
-
+#[cfg(target_os = "macos")]
 fn run_vm(
     disk_path: &Path,
     login_actions: &[LoginAction],
@@ -1087,7 +1177,6 @@ fn run_vm(
 
         let state = unsafe { vm.state() };
         if last_state != Some(state) {
-            //eprintln!("[state] {:?}", state);
             last_state = Some(state);
         }
         match vm_output_rx.try_recv() {
@@ -1113,7 +1202,6 @@ fn run_vm(
             Err(mpsc::TryRecvError::Disconnected) => {}
         }
         if state != objc2_virtualization::VZVirtualMachineState::Running {
-            //eprintln!("VM stopped with state: {:?}", state);
             break;
         }
     }
@@ -1125,6 +1213,7 @@ fn run_vm(
     exit_result
 }
 
+#[cfg(target_os = "macos")]
 fn nsurl_from_path(path: &Path) -> Result<Retained<NSURL>, Box<dyn std::error::Error>> {
     let abs_path = if path.is_absolute() {
         path.to_path_buf()
@@ -1139,43 +1228,8 @@ fn nsurl_from_path(path: &Path) -> Result<Retained<NSURL>, Box<dyn std::error::E
     Ok(NSURL::fileURLWithPath(&ns_path))
 }
 
-fn enable_raw_mode(fd: i32) -> io::Result<RawModeGuard> {
-    let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
-
-    if unsafe { libc::tcgetattr(fd, &mut attributes) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let original = attributes;
-
-    // Disable translation of carriage return to newline on input
-    attributes.c_iflag &= !(libc::ICRNL);
-    // Disable canonical mode (line buffering), echo, and signal generation
-    attributes.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
-    attributes.c_cc[libc::VMIN] = 0;
-    attributes.c_cc[libc::VTIME] = 1;
-
-    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &attributes) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    Ok(RawModeGuard { fd, original })
-}
-
-struct RawModeGuard {
-    fd: i32,
-    original: libc::termios,
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        unsafe {
-            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
-        }
-    }
-}
-
 // Ensure the running binary has com.apple.security.virtualization entitlements by checking and, if not, signing and relaunching.
+#[cfg(target_os = "macos")]
 pub fn ensure_signed() {
     let exe = std::env::current_exe().expect("failed to get current exe path");
     let exe_str = exe.to_str().expect("exe path not valid utf-8");
@@ -1230,4 +1284,420 @@ pub fn ensure_signed() {
             std::process::exit(1);
         }
     }
+}
+
+// ── Linux backend (cloud-hypervisor + virtiofsd) ──────────────────────────────
+
+#[cfg(target_os = "linux")]
+fn find_binary(name: &str) -> Option<PathBuf> {
+    // Check PATH first
+    if let Ok(path_var) = env::var("PATH") {
+        for dir in path_var.split(':') {
+            let candidate = PathBuf::from(dir).join(name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    // Check common install locations
+    for prefix in ["/usr/bin", "/usr/local/bin", "/opt/cloud-hypervisor"] {
+        let candidate = PathBuf::from(prefix).join(name);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Find EFI firmware for cloud-hypervisor. Returns the path to the firmware file.
+#[cfg(target_os = "linux")]
+fn find_efi_firmware() -> Option<PathBuf> {
+    // cloud-hypervisor ships its own firmware on some distros
+    let candidates: &[&str] = &[
+        "/usr/share/cloud-hypervisor/CLOUDHV.fd",
+        // OVMF (x86_64)
+        "/usr/share/ovmf/OVMF.fd",
+        "/usr/share/OVMF/OVMF.fd",
+        "/usr/share/edk2/ovmf/OVMF_CODE.fd",
+        "/usr/share/edk2-ovmf/OVMF_CODE.fd",
+        // AAVMF (aarch64)
+        "/usr/share/AAVMF/AAVMF_CODE.fd",
+        "/usr/share/aavmf/AAVMF_CODE.fd",
+        "/usr/share/edk2/aarch64/QEMU_EFI.fd",
+    ];
+    candidates
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.exists())
+}
+
+/// Send a raw HTTP GET to cloud-hypervisor's REST API over a Unix socket.
+/// Returns the response body (everything after the HTTP headers).
+#[cfg(target_os = "linux")]
+fn ch_api_get(socket_path: &Path, api_path: &str) -> Result<String, Box<dyn std::error::Error>> {
+    use std::io::Read;
+
+    let mut stream = UnixStream::connect(socket_path)
+        .map_err(|e| format!("connect to API socket: {e}"))?;
+
+    let request = format!(
+        "GET {} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
+        api_path
+    );
+    stream.write_all(request.as_bytes())?;
+    stream.flush()?;
+
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf)?;
+    let raw = String::from_utf8_lossy(&buf).into_owned();
+
+    // Strip HTTP headers — body starts after the blank line
+    if let Some(body_start) = raw.find("\r\n\r\n") {
+        Ok(raw[body_start + 4..].to_string())
+    } else {
+        Ok(raw)
+    }
+}
+
+/// Send a raw HTTP PUT to cloud-hypervisor's REST API over a Unix socket.
+#[cfg(target_os = "linux")]
+fn ch_api_put(
+    socket_path: &Path,
+    api_path: &str,
+    body: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Read;
+
+    let mut stream = UnixStream::connect(socket_path)
+        .map_err(|e| format!("connect to API socket: {e}"))?;
+
+    let request = format!(
+        "PUT {} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        api_path,
+        body.len(),
+        body
+    );
+    stream.write_all(request.as_bytes())?;
+    stream.flush()?;
+
+    // Drain response
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf)?;
+    Ok(())
+}
+
+/// Wait for the cloud-hypervisor API socket to appear, then query it to get
+/// the serial console PTY path. Retries for up to START_TIMEOUT.
+#[cfg(target_os = "linux")]
+fn wait_for_serial_pty(api_socket: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + START_TIMEOUT;
+
+    // Wait for the API socket file to appear
+    while !api_socket.exists() {
+        if Instant::now() >= deadline {
+            return Err("Timed out waiting for cloud-hypervisor API socket to appear".into());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // Poll until the VM is running and the PTY path is reported
+    loop {
+        if Instant::now() >= deadline {
+            return Err("Timed out waiting for cloud-hypervisor serial PTY".into());
+        }
+        thread::sleep(Duration::from_millis(100));
+
+        let body = match ch_api_get(api_socket, "/api/v1/vm.info") {
+            Ok(b) => b,
+            Err(_) => continue, // VM not ready yet
+        };
+
+        // cloud-hypervisor reports the PTY path in the JSON as:
+        //   "serial": { "file": "/dev/pts/N", "mode": "Pty", ... }
+        // We scan for "/dev/pts/" to extract it without a JSON parser.
+        if let Some(pos) = body.find("/dev/pts/") {
+            let rest = &body[pos..];
+            let end = rest
+                .find(|c: char| c == '"' || c == ',' || c == '}' || c == ' ' || c == '\n')
+                .unwrap_or(rest.len());
+            let pty_path = rest[..end].trim().to_string();
+            if !pty_path.is_empty() {
+                return Ok(PathBuf::from(pty_path));
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_vm(
+    disk_path: &Path,
+    login_actions: &[LoginAction],
+    directory_shares: &[DirectoryShare],
+    cpu_count: usize,
+    ram_bytes: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // ── Locate required binaries ──────────────────────────────────────────────
+
+    let ch_bin = find_binary("cloud-hypervisor").ok_or_else(|| {
+        "cloud-hypervisor not found.\n\
+         Install it with: sudo apt install cloud-hypervisor\n\
+         Or see: https://github.com/cloud-hypervisor/cloud-hypervisor/releases"
+    })?;
+
+    let virtiofsd_bin = if !directory_shares.is_empty() {
+        Some(find_binary("virtiofsd").ok_or_else(|| {
+            "virtiofsd not found.\n\
+             Install it with: sudo apt install virtiofsd\n\
+             Or see: https://gitlab.com/virtio-fs/virtiofsd"
+        })?)
+    } else {
+        None
+    };
+
+    let firmware = find_efi_firmware().ok_or_else(|| {
+        "EFI firmware not found.\n\
+         Install cloud-hypervisor firmware: sudo apt install cloud-hypervisor\n\
+         Or install OVMF: sudo apt install ovmf"
+    })?;
+
+    // ── Per-session temp directory ────────────────────────────────────────────
+
+    let pid = std::process::id();
+    let tmp_dir = std::env::temp_dir().join(format!("vibe-{pid}"));
+    fs::create_dir_all(&tmp_dir)?;
+
+    // Guard: remove tmp_dir when this scope ends
+    struct TmpDirGuard(PathBuf);
+    impl Drop for TmpDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _tmp_guard = TmpDirGuard(tmp_dir.clone());
+
+    // ── Start virtiofsd for each directory share ──────────────────────────────
+
+    let mut virtiofsd_children: Vec<std::process::Child> = Vec::new();
+
+    if let Some(ref vfsd) = virtiofsd_bin {
+        for share in directory_shares {
+            let socket_path = tmp_dir.join(format!("{}.sock", share.tag()));
+
+            let child = Command::new(vfsd)
+                .args([
+                    "--socket-path",
+                    &socket_path.to_string_lossy(),
+                    "--shared-dir",
+                    &share.host.to_string_lossy(),
+                    "--cache",
+                    "auto",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| format!("Failed to start virtiofsd: {e}"))?;
+
+            virtiofsd_children.push(child);
+        }
+
+        // Wait for all virtiofsd sockets to appear
+        let vfsd_deadline = Instant::now() + Duration::from_secs(10);
+        for share in directory_shares {
+            let socket_path = tmp_dir.join(format!("{}.sock", share.tag()));
+            while !socket_path.exists() {
+                if Instant::now() >= vfsd_deadline {
+                    return Err(format!(
+                        "Timed out waiting for virtiofsd socket for {}",
+                        share.host.display()
+                    )
+                    .into());
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+
+    // Guard: kill all virtiofsd children when this scope ends
+    struct VirtiofsdGuard(Vec<std::process::Child>);
+    impl Drop for VirtiofsdGuard {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    let _vfsd_guard = VirtiofsdGuard(virtiofsd_children);
+
+    // ── Build and launch cloud-hypervisor ─────────────────────────────────────
+
+    let api_socket = tmp_dir.join("api.sock");
+    let ram_mb = ram_bytes / BYTES_PER_MB;
+
+    let mut ch_cmd = Command::new(&ch_bin);
+    ch_cmd.args([
+        "--firmware",
+        &firmware.to_string_lossy(),
+        "--disk",
+        &format!("path={}", disk_path.to_string_lossy()),
+        "--memory",
+        &format!("size={}M", ram_mb),
+        "--cpus",
+        &format!("boot={}", cpu_count),
+        "--net",
+        "tap=,mac=,ip=,mask=",
+        "--serial",
+        "pty",
+        "--console",
+        "off",
+        "--api-socket",
+        &api_socket.to_string_lossy(),
+    ]);
+
+    // One --fs entry per directory share
+    for share in directory_shares {
+        let socket_path = tmp_dir.join(format!("{}.sock", share.tag()));
+        ch_cmd.args([
+            "--fs",
+            &format!(
+                "tag={},socket={},num_queues=1,queue_size=1024",
+                share.tag(),
+                socket_path.to_string_lossy()
+            ),
+        ]);
+    }
+
+    let mut ch_process = ch_cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to start cloud-hypervisor: {e}"))?;
+
+    // Guard: kill cloud-hypervisor if we return early
+    struct ChGuard(Option<std::process::Child>);
+    impl Drop for ChGuard {
+        fn drop(&mut self) {
+            if let Some(ref mut child) = self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    let mut ch_guard = ChGuard(None); // We move ch_process in below
+
+    // ── Find the serial PTY ───────────────────────────────────────────────────
+
+    let pty_path = match wait_for_serial_pty(&api_socket) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = ch_process.kill();
+            return Err(e);
+        }
+    };
+
+    ch_guard.0 = Some(ch_process);
+
+    println!("VM booting...");
+
+    // Open the slave PTY for bidirectional console I/O
+    let pty_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&pty_path)
+        .map_err(|e| format!("Failed to open serial PTY {}: {e}", pty_path.display()))?;
+
+    let vm_output_fd: OwnedFd = pty_file.try_clone()?.into();
+    let vm_input_fd: OwnedFd = pty_file.into();
+
+    // ── Wire up I/O ───────────────────────────────────────────────────────────
+
+    let output_monitor = Arc::new(OutputMonitor::default());
+    let io_ctx = spawn_vm_io(output_monitor.clone(), vm_output_fd, vm_input_fd);
+
+    // ── Build login action sequence ───────────────────────────────────────────
+
+    let mut all_login_actions = vec![
+        Expect {
+            text: "login: ".to_string(),
+            timeout: LOGIN_EXPECT_TIMEOUT,
+        },
+        Send("root".to_string()),
+        Expect {
+            text: "~#".to_string(),
+            timeout: LOGIN_EXPECT_TIMEOUT,
+        },
+        Send("stty sane".to_string()),
+    ];
+
+    // On Linux each virtiofs share gets its own tag and is mounted directly
+    // at the target guest path — no staging directory needed.
+    for share in directory_shares {
+        let guest = share.guest.to_string_lossy();
+        all_login_actions.push(Send(format!("mkdir -p {}", guest)));
+        all_login_actions.push(Send(format!(
+            "mount -t virtiofs {} {}",
+            share.tag(),
+            guest
+        )));
+    }
+
+    for a in login_actions {
+        all_login_actions.push(a.clone());
+    }
+
+    // ── Event loop ────────────────────────────────────────────────────────────
+
+    let (vm_output_tx, vm_output_rx) = mpsc::channel::<VmOutput>();
+    let login_actions_thread = spawn_login_actions_thread(
+        all_login_actions,
+        output_monitor.clone(),
+        io_ctx.input_tx.clone(),
+        vm_output_tx,
+    );
+
+    let mut exit_result: Result<(), Box<dyn std::error::Error>> = Ok(());
+
+    loop {
+        // Check if cloud-hypervisor process has exited (VM shutdown)
+        let ch = ch_guard.0.as_mut().unwrap();
+        match ch.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(e) => {
+                exit_result = Err(format!("Error waiting for cloud-hypervisor: {e}").into());
+                break;
+            }
+        }
+
+        // Check for login action timeouts
+        match vm_output_rx.try_recv() {
+            Ok(VmOutput::LoginActionTimeout { action, timeout }) => {
+                exit_result = Err(format!(
+                    "Login action ({}) timed out after {:?}; shutting down.",
+                    action, timeout
+                )
+                .into());
+                // Request clean VM shutdown via the REST API
+                let _ = ch_api_put(&api_socket, "/api/v1/vm.shutdown", "");
+                break;
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {}
+        }
+
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    let _ = login_actions_thread.join();
+    io_ctx.shutdown();
+
+    // cloud-hypervisor will exit on its own after VM shutdown; we wait briefly
+    if let Some(ref mut ch) = ch_guard.0 {
+        let _ = ch.wait();
+    }
+    ch_guard.0 = None; // prevent double-kill in Drop
+
+    exit_result
 }
