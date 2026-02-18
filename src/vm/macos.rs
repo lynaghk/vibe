@@ -14,7 +14,7 @@ use std::{
 
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
-use objc2::{rc::Retained, runtime::ProtocolObject};
+use objc2::{rc::Retained, runtime::ProtocolObject, AnyThread};
 use objc2_foundation::*;
 use objc2_virtualization::*;
 
@@ -122,9 +122,10 @@ fn create_vm_configuration(
 
         // Disk
         {
+            let disk_url = nsurl_from_path(disk_path)?;
             let attach = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_cachingMode_synchronizationMode_error(
                 VZDiskImageStorageDeviceAttachment::alloc(),
-                &nsurl_from_path(disk_path)?,
+                &disk_url,
                 false,
                 VZDiskImageCachingMode::Cached,
                 VZDiskImageSynchronizationMode::Full,
@@ -305,6 +306,7 @@ pub fn run_vm(
                 }
                 break;
             }
+            Ok(VmOutput::GuestLogout) => { break; }
             Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => {}
         }
 

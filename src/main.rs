@@ -31,7 +31,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.help {
-        let mut help = format!(
+        let mut help = String::new();
+        help.push_str(&format!(
             "Vibe is a quick way to spin up a Linux virtual machine to sandbox LLM agents.
 
 vibe [OPTIONS] [disk-image.raw]
@@ -50,8 +51,8 @@ Options
   --send <some-command>                                     Type `some-command` followed by newline into the VM.
   --expect <string> [timeout-seconds]                       Wait for `string` to appear in console output before executing next `--script` or `--send`.
                                                             If `string` does not appear within timeout (default 30 seconds), shutdown VM with error.
-"
-        );
+                                                            "
+                                                            ));
         #[cfg(target_os = "linux")]
         {
             let (ch_ok, qemu_ok) = vm::available_backends();
