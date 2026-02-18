@@ -134,13 +134,10 @@ pub fn ensure_default_image(
         .set_len(20 * 1024 * BYTES_PER_MB)?; // 20 GiB
 
     let provision_command = script_command_from_content("provision.sh", PROVISION_SCRIPT)?;
-    run_vm(
-        default_raw,
-        &[Send(provision_command)],
-        directory_shares,
-        DEFAULT_CPU_COUNT,
-        DEFAULT_RAM_BYTES,
-    )?;
+    #[cfg(target_os = "linux")]
+    run_vm(default_raw, &[Send(provision_command)], directory_shares, DEFAULT_CPU_COUNT, DEFAULT_RAM_BYTES, None)?;
+    #[cfg(not(target_os = "linux"))]
+    run_vm(default_raw, &[Send(provision_command)], directory_shares, DEFAULT_CPU_COUNT, DEFAULT_RAM_BYTES)?;
 
     Ok(())
 }

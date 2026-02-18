@@ -1,2 +1,5 @@
 [tools]
 rust = "latest"
+
+[tasks.install]
+run = "cargo install --locked --path ."

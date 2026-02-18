@@ -9,6 +9,13 @@ pub(crate) const DEFAULT_RAM_MB: u64 = 2048;
 pub(crate) const DEFAULT_RAM_BYTES: u64 = DEFAULT_RAM_MB * 1024 * 1024;
 const DEFAULT_EXPECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Backend {
+    CloudHypervisor,
+    Qemu,
+}
+
 pub struct CliArgs {
     pub disk: Option<PathBuf>,
     pub version: bool,
@@ -18,6 +25,8 @@ pub struct CliArgs {
     pub login_actions: Vec<LoginAction>,
     pub cpu_count: usize,
     pub ram_bytes: u64,
+    #[cfg(target_os = "linux")]
+    pub backend: Option<Backend>,
 }
 
 pub fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
@@ -37,6 +46,8 @@ pub fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
     let mut script_index = 0;
     let mut cpu_count = DEFAULT_CPU_COUNT;
     let mut ram_bytes = DEFAULT_RAM_BYTES;
+    #[cfg(target_os = "linux")]
+    let mut backend: Option<Backend> = None;
 
     while let Some(arg) = parser.next()? {
         match arg {
@@ -52,6 +63,25 @@ pub fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
                 let value: u64 = os_to_string(parser.value()?, "--ram")?.parse()?;
                 if value == 0 { return Err("--ram must be >= 1".into()); }
                 ram_bytes = value * 1024 * 1024;
+            }
+            Long("backend") => {
+                let val = os_to_string(parser.value()?, "--backend")?;
+                #[cfg(target_os = "linux")]
+                {
+                    backend = Some(match val.as_str() {
+                        "ch" | "cloud-hypervisor" => Backend::CloudHypervisor,
+                        "qemu" => Backend::Qemu,
+                        other => return Err(format!(
+                            "Unknown --backend {:?}: expected ch, cloud-hypervisor, or qemu",
+                            other
+                        ).into()),
+                    });
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = val;
+                    return Err("--backend is only supported on Linux".into());
+                }
             }
             Long("mount") => {
                 mounts.push(os_to_string(parser.value()?, "--mount")?);
@@ -86,5 +116,16 @@ pub fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         }
     }
 
-    Ok(CliArgs { disk, version, help, no_default_mounts, mounts, login_actions, cpu_count, ram_bytes })
+    Ok(CliArgs {
+        disk,
+        version,
+        help,
+        no_default_mounts,
+        mounts,
+        login_actions,
+        cpu_count,
+        ram_bytes,
+        #[cfg(target_os = "linux")]
+        backend,
+    })
 }

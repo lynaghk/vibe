@@ -10,8 +10,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use libc;
-
 use crate::{
     disk::BYTES_PER_MB,
     io::{
@@ -21,16 +19,9 @@ use crate::{
     share::DirectoryShare,
 };
 
-const START_TIMEOUT: Duration = Duration::from_secs(60);
-const LOGIN_EXPECT_TIMEOUT: Duration = Duration::from_secs(120);
+// ── Firmware discovery ────────────────────────────────────────────────────────
 
-// ── Binary / firmware discovery ───────────────────────────────────────────────
-
-fn find_binary(name: &str) -> Option<PathBuf> {
-    env::var("PATH").ok()?.split(':').map(|dir| PathBuf::from(dir).join(name)).find(|p| p.exists())
-}
-
-fn find_efi_firmware() -> Option<PathBuf> {
+fn find_ch_firmware() -> Option<PathBuf> {
     // Check user-local path first (for manual cloud-hypervisor installs)
     let user_local = env::var("HOME").ok().map(|h| {
         PathBuf::from(h).join(".local/share/cloud-hypervisor/CLOUDHV.fd")
@@ -41,54 +32,19 @@ fn find_efi_firmware() -> Option<PathBuf> {
 
     let candidates: &[&str] = &[
         "/usr/share/cloud-hypervisor/CLOUDHV.fd",  // apt package
-        "/usr/share/ovmf/OVMF.fd",
-        "/usr/share/OVMF/OVMF.fd",
-        "/usr/share/edk2/ovmf/OVMF_CODE.fd",
-        "/usr/share/edk2-ovmf/OVMF_CODE.fd",
-        "/usr/share/AAVMF/AAVMF_CODE.fd",
-        "/usr/share/aavmf/AAVMF_CODE.fd",
-        "/usr/share/edk2/aarch64/QEMU_EFI.fd",
     ];
     candidates.iter().map(PathBuf::from).find(|p| p.exists())
 }
 
-// ── Preflight ────────────────────────────────────────────────────────────────
+// ── Availability check ────────────────────────────────────────────────────────
 
-fn check_kvm() -> Result<(), Box<dyn std::error::Error>> {
-    let kvm = std::path::Path::new("/dev/kvm");
-
-    if !kvm.exists() {
-        return Err(
-            "KVM device /dev/kvm not found.\n\
-             Make sure the kvm kernel module is loaded: sudo modprobe kvm\n\
-             On Intel: sudo modprobe kvm_intel\n\
-             On AMD:   sudo modprobe kvm_amd"
-                .into(),
-        );
-    }
-
-    // Check read+write access via access(2) — cheaper than opening the device.
-    let ok = unsafe { libc::access(c"/dev/kvm".as_ptr(), libc::R_OK | libc::W_OK) } == 0;
-    if !ok {
-        let username = env::var("USER").unwrap_or_else(|_| "your user".into());
-        return Err(format!(
-            "Permission denied on /dev/kvm.\n\
-             Add {username} to the kvm group, then start a new shell:\n\
-             \n  sudo usermod -aG kvm {username}\n  newgrp kvm"
-        )
-        .into());
-    }
-
-    Ok(())
+pub fn is_available() -> bool {
+    super::find_binary("cloud-hypervisor").is_some() && find_ch_firmware().is_some()
 }
 
-fn check_tap_networking(ch_bin: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    // Detect whether cloud-hypervisor has cap_net_admin (via file capabilities)
-    // by checking if it can open /dev/net/tun — the ioctl itself needs cap_net_admin,
-    // but a simple heuristic is to check the binary's effective capabilities.
-    // The simplest portable check: try stat-ing /dev/net/tun.
-    // Actual capability check requires parsing /proc/self/status or using libcap.
-    // Instead, we rely on the error from cloud-hypervisor itself and give a good message here.
+// ── Preflight ────────────────────────────────────────────────────────────────
+
+fn check_tap_networking(ch_bin: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let _ = ch_bin; // used for the error message
 
     // Check that /dev/net/tun exists at all.
@@ -100,10 +56,7 @@ fn check_tap_networking(ch_bin: &std::path::Path) -> Result<(), Box<dyn std::err
         );
     }
 
-    // Check that cloud-hypervisor has cap_net_admin by reading its capability set.
-    // /proc/self/status won't help here (we're checking CH, not ourselves).
-    // Try reading the xattr security.capability on the binary — if it has cap_net_admin
-    // we're good; otherwise warn.
+    // Check that cloud-hypervisor has cap_net_admin.
     let cap_ok = std::process::Command::new("getcap")
         .arg(ch_bin)
         .output()
@@ -182,7 +135,7 @@ fn extract_pty_path(body: &str) -> Option<PathBuf> {
 }
 
 fn wait_for_serial_pty(api_socket: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + START_TIMEOUT;
+    let deadline = Instant::now() + super::START_TIMEOUT;
 
     while !api_socket.exists() {
         if Instant::now() >= deadline {
@@ -223,11 +176,11 @@ pub fn run_vm(
 
     let mut preflight_errors: Vec<String> = Vec::new();
 
-    if let Err(e) = check_kvm() {
+    if let Err(e) = super::check_kvm() {
         preflight_errors.push(e.to_string());
     }
 
-    let ch_bin = find_binary("cloud-hypervisor");
+    let ch_bin = super::find_binary("cloud-hypervisor");
     if ch_bin.is_none() {
         preflight_errors.push(
             "cloud-hypervisor not found in PATH.\n\
@@ -238,21 +191,15 @@ pub fn run_vm(
         );
     }
 
-    let virtiofsd_bin = if !directory_shares.is_empty() {
-        let bin = find_binary("virtiofsd");
-        if bin.is_none() {
-            preflight_errors.push(
-                "virtiofsd not found in PATH.\n\
-                 Install: sudo apt install virtiofsd  (Ubuntu 23.10+)\n\
-                 Or via cargo: cargo install virtiofsd  (then add ~/.cargo/bin to PATH)\n\
-                 Or download from: https://gitlab.com/virtio-fs/virtiofsd/-/releases"
-                    .into(),
-            );
-        }
-        bin
-    } else {
-        None
-    };
+    if !directory_shares.is_empty() && super::find_binary("virtiofsd").is_none() {
+        preflight_errors.push(
+            "virtiofsd not found in PATH.\n\
+             Install: sudo apt install virtiofsd  (Ubuntu 23.10+)\n\
+             Or via cargo: cargo install virtiofsd  (then add ~/.cargo/bin to PATH)\n\
+             Or download from: https://gitlab.com/virtio-fs/virtiofsd/-/releases"
+                .into(),
+        );
+    }
 
     if let Some(ref bin) = ch_bin {
         if let Err(e) = check_tap_networking(bin) {
@@ -260,12 +207,13 @@ pub fn run_vm(
         }
     }
 
-    if find_efi_firmware().is_none() {
+    let firmware = find_ch_firmware();
+    if firmware.is_none() {
         preflight_errors.push(
-            "EFI firmware not found.\n\
-             Download CLOUDHV.fd (recommended for cloud-hypervisor):\n\
+            "cloud-hypervisor EFI firmware (CLOUDHV.fd) not found.\n\
+             Download it:\n\
              \n  mkdir -p ~/.local/share/cloud-hypervisor\n  curl -L -o ~/.local/share/cloud-hypervisor/CLOUDHV.fd https://github.com/cloud-hypervisor/edk2/releases/latest/download/CLOUDHV.fd\n\
-             \nOr install via apt: sudo apt install ovmf  (x86_64) or sudo apt install qemu-efi-aarch64  (aarch64)"
+             \nOr install via apt: sudo apt install cloud-hypervisor"
                 .into(),
         );
     }
@@ -275,7 +223,7 @@ pub fn run_vm(
     }
 
     let ch_bin = ch_bin.unwrap();
-    let firmware = find_efi_firmware().unwrap();
+    let firmware = firmware.unwrap();
 
     // ── Per-session temp directory ────────────────────────────────────────────
 
@@ -291,49 +239,7 @@ pub fn run_vm(
 
     // ── Start virtiofsd for each directory share ──────────────────────────────
 
-    let mut virtiofsd_children: Vec<std::process::Child> = Vec::new();
-
-    if let Some(ref vfsd) = virtiofsd_bin {
-        for share in directory_shares {
-            let socket_path = tmp_dir.join(format!("{}.sock", share.tag()));
-            let child = Command::new(vfsd)
-                .args([
-                    "--socket-path", &socket_path.to_string_lossy(),
-                    "--shared-dir",  &share.host.to_string_lossy(),
-                    "--cache", "auto",
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|e| format!("Failed to start virtiofsd: {e}"))?;
-            virtiofsd_children.push(child);
-        }
-
-        // Wait for all virtiofsd sockets to appear
-        let vfsd_deadline = Instant::now() + Duration::from_secs(10);
-        for share in directory_shares {
-            let socket_path = tmp_dir.join(format!("{}.sock", share.tag()));
-            while !socket_path.exists() {
-                if Instant::now() >= vfsd_deadline {
-                    return Err(format!(
-                        "Timed out waiting for virtiofsd socket for {}",
-                        share.host.display()
-                    )
-                    .into());
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
-        }
-    }
-
-    struct VirtiofsdGuard(Vec<std::process::Child>);
-    impl Drop for VirtiofsdGuard {
-        fn drop(&mut self) {
-            for child in &mut self.0 { let _ = child.kill(); let _ = child.wait(); }
-        }
-    }
-    let _vfsd_guard = VirtiofsdGuard(virtiofsd_children);
+    let _vfsd_guard = super::start_virtiofsd(directory_shares, &tmp_dir)?;
 
     // ── Build and launch cloud-hypervisor ─────────────────────────────────────
 
@@ -368,7 +274,7 @@ pub fn run_vm(
     let mut ch_process = ch_cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit()) // surface cloud-hypervisor errors to the user
+        .stderr(Stdio::inherit())
         .spawn()
         .map_err(|e| format!("Failed to start cloud-hypervisor: {e}"))?;
 
@@ -405,13 +311,12 @@ pub fn run_vm(
     let io_ctx = spawn_vm_io(output_monitor.clone(), vm_output_fd, vm_input_fd);
 
     let mut all_login_actions = vec![
-        LoginAction::Expect { text: "login: ".into(), timeout: LOGIN_EXPECT_TIMEOUT },
+        LoginAction::Expect { text: "login: ".into(), timeout: super::LOGIN_EXPECT_TIMEOUT },
         Send("root".into()),
-        LoginAction::Expect { text: "~#".into(), timeout: LOGIN_EXPECT_TIMEOUT },
+        LoginAction::Expect { text: "~#".into(), timeout: super::LOGIN_EXPECT_TIMEOUT },
         Send("stty sane".into()),
     ];
 
-    // Each virtiofs share is mounted directly at its guest path — no staging needed.
     for share in directory_shares {
         let guest = share.guest.to_string_lossy();
         all_login_actions.push(Send(format!("mkdir -p {}", guest)));

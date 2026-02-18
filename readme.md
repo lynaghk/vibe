@@ -38,7 +38,28 @@ Dependencies:
 
 **Linux (x86\_64 or aarch64)**
 
-On Ubuntu 24.04 or later, install everything at once:
+Vibe supports two VM backends on Linux: **QEMU** (simpler setup) and **cloud-hypervisor** (faster boot, ~1s vs ~3-5s). It auto-detects whichever is available, preferring cloud-hypervisor when both are installed.
+
+**QEMU (recommended for quick setup)**
+
+    sudo apt install qemu-system-x86 ovmf
+
+    # Allow your user to access KVM
+    sudo usermod -aG kvm $USER && newgrp kvm
+
+`virtiofsd` is also required. On Ubuntu 23.10+, it's in apt:
+
+    sudo apt install virtiofsd
+
+On Ubuntu 22.04 / other older distros, install it via cargo:
+
+    cargo install virtiofsd
+
+That's it. QEMU uses standard OVMF firmware and user-mode networking — no extra downloads or capability grants needed.
+
+**cloud-hypervisor (faster boot)**
+
+On Ubuntu 24.04 or later:
 
     sudo apt install cloud-hypervisor virtiofsd ovmf
 
@@ -63,6 +84,8 @@ Then do two one-time permission grants so vibe can use KVM and create TAP networ
     sudo setcap cap_net_admin+ep $(which cloud-hypervisor)
 
 Then start a new shell (or run `newgrp kvm`) for the group change to take effect.
+
+When both backends are installed, use `--backend <ch|qemu>` to select one explicitly.
 
 A network connection is required on the first run to download and configure the Debian Linux base image.
 

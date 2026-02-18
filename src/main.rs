@@ -31,7 +31,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.help {
-        println!(
+        let mut help = format!(
             "Vibe is a quick way to spin up a Linux virtual machine to sandbox LLM agents.
 
 vibe [OPTIONS] [disk-image.raw]
@@ -52,6 +52,16 @@ Options
                                                             If `string` does not appear within timeout (default 30 seconds), shutdown VM with error.
 "
         );
+        #[cfg(target_os = "linux")]
+        {
+            let (ch_ok, qemu_ok) = vm::available_backends();
+            if ch_ok && qemu_ok {
+                help.push_str(
+                    "  --backend <ch|qemu>                                       Select VM backend (auto-detected if omitted).\n"
+                );
+            }
+        }
+        print!("{help}");
         std::process::exit(0);
     }
 
@@ -151,5 +161,8 @@ Options
 
     login_actions.extend(args.login_actions);
 
-    run_vm(&disk_path, &login_actions, &directory_shares, args.cpu_count, args.ram_bytes)
+    #[cfg(target_os = "linux")]
+    { run_vm(&disk_path, &login_actions, &directory_shares, args.cpu_count, args.ram_bytes, args.backend) }
+    #[cfg(not(target_os = "linux"))]
+    { run_vm(&disk_path, &login_actions, &directory_shares, args.cpu_count, args.ram_bytes) }
 }
