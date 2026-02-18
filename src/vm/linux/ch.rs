@@ -359,6 +359,10 @@ pub fn run_vm(
                 let _ = ch_api_put(&api_socket, "/api/v1/vm.shutdown", "");
                 break;
             }
+            Ok(VmOutput::GuestLogout) => {
+                let _ = ch_api_put(&api_socket, "/api/v1/vm.shutdown", "");
+                break;
+            }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {}
         }

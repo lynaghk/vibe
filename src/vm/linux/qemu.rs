@@ -331,6 +331,12 @@ pub fn run_vm(
                 }
                 break;
             }
+            Ok(VmOutput::GuestLogout) => {
+                if let Some(ref mut c) = qemu_guard.0 {
+                    let _ = c.kill();
+                }
+                break;
+            }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {}
         }

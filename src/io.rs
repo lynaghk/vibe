@@ -9,6 +9,7 @@ use std::{
     },
     path::PathBuf,
     sync::{
+        atomic::{AtomicBool, Ordering},
         Arc, Condvar, Mutex,
         mpsc::{self, Receiver, Sender},
     },
@@ -32,6 +33,7 @@ pub enum VmInput {
 
 pub(crate) enum VmOutput {
     LoginActionTimeout { action: String, timeout: Duration },
+    GuestLogout,
 }
 
 #[derive(PartialEq, Eq)]
@@ -44,6 +46,7 @@ pub enum WaitResult {
 pub struct OutputMonitor {
     buffer: Mutex<String>,
     condvar: Condvar,
+    closed: AtomicBool,
 }
 
 impl OutputMonitor {
@@ -55,10 +58,16 @@ impl OutputMonitor {
         self.condvar.notify_all();
     }
 
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+        self.condvar.notify_all();
+    }
+
     pub fn wait_for(&self, needle: &str, timeout: Duration) -> WaitResult {
         let (_unused, timeout_result) = self
             .condvar
             .wait_timeout_while(self.buffer.lock().unwrap(), timeout, |buf| {
+                if self.closed.load(Ordering::Relaxed) { return false; }
                 if let Some((_, remaining)) = buf.split_once(needle) {
                     *buf = remaining.to_string();
                     false
@@ -68,7 +77,31 @@ impl OutputMonitor {
             })
             .unwrap();
 
-        if timeout_result.timed_out() {
+        if self.closed.load(Ordering::Relaxed) || timeout_result.timed_out() {
+            WaitResult::Timeout
+        } else {
+            WaitResult::Found
+        }
+    }
+
+    /// Like `wait_for` but with no timeout. Returns `Found` or `Timeout` (if the
+    /// monitor is closed before the needle appears).
+    pub fn wait_forever(&self, needle: &str) -> WaitResult {
+        let guard = self
+            .condvar
+            .wait_while(self.buffer.lock().unwrap(), |buf| {
+                if self.closed.load(Ordering::Relaxed) { return false; }
+                if let Some((_, remaining)) = buf.split_once(needle) {
+                    *buf = remaining.to_string();
+                    false
+                } else {
+                    true
+                }
+            })
+            .unwrap();
+        drop(guard);
+
+        if self.closed.load(Ordering::Relaxed) {
             WaitResult::Timeout
         } else {
             WaitResult::Found
@@ -169,6 +202,8 @@ pub fn spawn_vm_io(
                     }
                 }
             }
+            // Signal any threads blocked in wait_forever that the VM output has closed.
+            output_monitor.close();
         }
     });
 
@@ -233,6 +268,12 @@ pub fn spawn_login_actions_thread(
                     input_tx.send(VmInput::Bytes(text.into_bytes())).unwrap();
                 }
             }
+        }
+
+        // All login actions completed — now watch for the user logging out.
+        // When the shell exits, the guest will print the login prompt again.
+        if WaitResult::Found == output_monitor.wait_forever("login: ") {
+            let _ = vm_output_tx.send(VmOutput::GuestLogout);
         }
     })
 }
