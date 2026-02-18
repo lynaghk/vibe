@@ -35,24 +35,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         help.push_str(&format!(
             "Vibe is a quick way to spin up a Linux virtual machine to sandbox LLM agents.
 
-vibe [OPTIONS] [disk-image.raw]
+    vibe [OPTIONS] [disk-image.raw]
 
-Options
+    Options
 
-  --help                                                    Print this help message.
-  --version                                                 Print the version (commit SHA).
-  --no-default-mounts                                       Disable all default mounts, including .git and .vibe project subfolder masking.
-  --mount host-path:guest-path[:read-only | :read-write]    Mount `host-path` inside VM at `guest-path`.
-                                                            Defaults to read-write.
-                                                            Errors if host-path does not exist.
-  --cpus <count>                                            Number of virtual CPUs (default {DEFAULT_CPU_COUNT}).
-  --ram <megabytes>                                         RAM size in megabytes (default {DEFAULT_RAM_MB}).
-  --script <path/to/script.sh>                              Run script in VM.
-  --send <some-command>                                     Type `some-command` followed by newline into the VM.
-  --expect <string> [timeout-seconds]                       Wait for `string` to appear in console output before executing next `--script` or `--send`.
-                                                            If `string` does not appear within timeout (default 30 seconds), shutdown VM with error.
-                                                            "
-                                                            ));
+    --help                                                    Print this help message.
+    --version                                                 Print the version (commit SHA).
+    --no-default-mounts                                       Disable all default mounts, including .git and .vibe project subfolder masking.
+    --mount host-path:guest-path[:read-only | :read-write]    Mount `host-path` inside VM at `guest-path`.
+                                                             Defaults to read-write.
+                                                             Errors if host-path does not exist.
+    --cpus <count>                                            Number of virtual CPUs (default {DEFAULT_CPU_COUNT}).
+    --ram <megabytes>                                         RAM size in megabytes (default {DEFAULT_RAM_MB}).
+    --script <path/to/script.sh>                              Run script in VM.
+    --send <some-command>                                     Type `some-command` followed by newline into the VM.
+    --expect <string> [timeout-seconds]                       Wait for `string` to appear in console output before executing next `--script` or `--send`.
+                                                             If `string` does not appear within timeout (default 30 seconds), shutdown VM with error.
+                                                             "
+        ));
         #[cfg(target_os = "linux")]
         {
             let (ch_ok, qemu_ok) = vm::available_backends();
