@@ -251,7 +251,7 @@ pub fn run_vm(
     let mut ch_process = ch_cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit()) // surface cloud-hypervisor errors to the user
         .spawn()
         .map_err(|e| format!("Failed to start cloud-hypervisor: {e}"))?;
 
