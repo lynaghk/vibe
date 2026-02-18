@@ -38,9 +38,21 @@ Dependencies:
 
 **Linux (x86\_64 or aarch64)**
 
-Install the required packages (Ubuntu/Debian):
+On Ubuntu 24.04 or later, install everything at once:
 
     sudo apt install cloud-hypervisor virtiofsd ovmf
+
+On Ubuntu 22.04 / other distros without `cloud-hypervisor` in apt, install the binaries manually and download the cloud-hypervisor-specific EFI firmware (`CLOUDHV.fd`; the standard `ovmf` package won't work):
+
+    # Download cloud-hypervisor and virtiofsd
+    curl -L -o ~/.local/bin/cloud-hypervisor https://github.com/cloud-hypervisor/cloud-hypervisor/releases/latest/download/cloud-hypervisor-static
+    curl -L -o ~/.local/bin/virtiofsd https://gitlab.com/virtio-fs/virtiofsd/-/releases/permalink/latest/downloads/virtiofsd-x86_64
+    chmod +x ~/.local/bin/cloud-hypervisor ~/.local/bin/virtiofsd
+
+    # Download CLOUDHV.fd firmware (cloud-hypervisor requires its own EFI build)
+    mkdir -p ~/.local/share/cloud-hypervisor
+    curl -L -o ~/.local/share/cloud-hypervisor/CLOUDHV.fd \
+      https://github.com/cloud-hypervisor/edk2/releases/latest/download/CLOUDHV.fd
 
 Then do two one-time permission grants so vibe can use KVM and create TAP network interfaces without running as root:
 

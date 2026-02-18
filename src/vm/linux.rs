@@ -31,8 +31,16 @@ fn find_binary(name: &str) -> Option<PathBuf> {
 }
 
 fn find_efi_firmware() -> Option<PathBuf> {
+    // Check user-local path first (for manual cloud-hypervisor installs)
+    let user_local = env::var("HOME").ok().map(|h| {
+        PathBuf::from(h).join(".local/share/cloud-hypervisor/CLOUDHV.fd")
+    });
+    if let Some(ref p) = user_local {
+        if p.exists() { return Some(p.clone()); }
+    }
+
     let candidates: &[&str] = &[
-        "/usr/share/cloud-hypervisor/CLOUDHV.fd",
+        "/usr/share/cloud-hypervisor/CLOUDHV.fd",  // apt package
         "/usr/share/ovmf/OVMF.fd",
         "/usr/share/OVMF/OVMF.fd",
         "/usr/share/edk2/ovmf/OVMF_CODE.fd",
@@ -255,8 +263,9 @@ pub fn run_vm(
     if find_efi_firmware().is_none() {
         preflight_errors.push(
             "EFI firmware not found.\n\
-             Install: sudo apt install ovmf  (x86_64) or sudo apt install qemu-efi-aarch64  (aarch64)\n\
-             Or: sudo apt install cloud-hypervisor  (includes CLOUDHV.fd on some distros)"
+             Download CLOUDHV.fd (recommended for cloud-hypervisor):\n\
+             \n  mkdir -p ~/.local/share/cloud-hypervisor\n  curl -L -o ~/.local/share/cloud-hypervisor/CLOUDHV.fd https://github.com/cloud-hypervisor/edk2/releases/latest/download/CLOUDHV.fd\n\
+             \nOr install via apt: sudo apt install ovmf  (x86_64) or sudo apt install qemu-efi-aarch64  (aarch64)"
                 .into(),
         );
     }
