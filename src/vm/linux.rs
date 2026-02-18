@@ -74,6 +74,48 @@ fn check_kvm() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn check_tap_networking(ch_bin: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    // Detect whether cloud-hypervisor has cap_net_admin (via file capabilities)
+    // by checking if it can open /dev/net/tun — the ioctl itself needs cap_net_admin,
+    // but a simple heuristic is to check the binary's effective capabilities.
+    // The simplest portable check: try stat-ing /dev/net/tun.
+    // Actual capability check requires parsing /proc/self/status or using libcap.
+    // Instead, we rely on the error from cloud-hypervisor itself and give a good message here.
+    let _ = ch_bin; // used for the error message
+
+    // Check that /dev/net/tun exists at all.
+    if !std::path::Path::new("/dev/net/tun").exists() {
+        return Err(
+            "TUN/TAP device /dev/net/tun not found.\n\
+             Make sure the tun kernel module is loaded: sudo modprobe tun"
+                .into(),
+        );
+    }
+
+    // Check that cloud-hypervisor has cap_net_admin by reading its capability set.
+    // /proc/self/status won't help here (we're checking CH, not ourselves).
+    // Try reading the xattr security.capability on the binary — if it has cap_net_admin
+    // we're good; otherwise warn.
+    let cap_ok = std::process::Command::new("getcap")
+        .arg(ch_bin)
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("cap_net_admin"))
+        .unwrap_or(false);
+
+    if !cap_ok {
+        return Err(format!(
+            "cloud-hypervisor lacks cap_net_admin needed to create TAP network interfaces.\n\
+             Grant it once with:\n\
+             \n  sudo setcap cap_net_admin+ep {}\n",
+            ch_bin.display()
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
 // ── cloud-hypervisor REST API (raw HTTP/1.1 over Unix socket) ─────────────────
 
 fn ch_api_get(socket_path: &Path, api_path: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -169,35 +211,62 @@ pub fn run_vm(
     cpu_count: usize,
     ram_bytes: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // ── Preflight checks ─────────────────────────────────────────────────────
+    // ── Preflight checks (collect all issues before failing) ─────────────────
 
-    check_kvm()?;
+    let mut preflight_errors: Vec<String> = Vec::new();
 
-    // ── Locate required binaries ──────────────────────────────────────────────
+    if let Err(e) = check_kvm() {
+        preflight_errors.push(e.to_string());
+    }
 
-    let ch_bin = find_binary("cloud-hypervisor").ok_or(
-        "cloud-hypervisor not found in PATH.\n\
-         Install: sudo apt install cloud-hypervisor\n\
-         Or download from: https://github.com/cloud-hypervisor/cloud-hypervisor/releases\n\
-         Then ensure it is in your PATH.",
-    )?;
+    let ch_bin = find_binary("cloud-hypervisor");
+    if ch_bin.is_none() {
+        preflight_errors.push(
+            "cloud-hypervisor not found in PATH.\n\
+             Install: sudo apt install cloud-hypervisor\n\
+             Or download from: https://github.com/cloud-hypervisor/cloud-hypervisor/releases\n\
+             Then ensure it is in your PATH."
+                .into(),
+        );
+    }
 
     let virtiofsd_bin = if !directory_shares.is_empty() {
-        Some(find_binary("virtiofsd").ok_or(
-            "virtiofsd not found in PATH.\n\
-             Install: sudo apt install virtiofsd  (Ubuntu 23.10+)\n\
-             Or via cargo: cargo install virtiofsd  (then add ~/.cargo/bin to PATH)\n\
-             Or download from: https://gitlab.com/virtio-fs/virtiofsd/-/releases",
-        )?)
+        let bin = find_binary("virtiofsd");
+        if bin.is_none() {
+            preflight_errors.push(
+                "virtiofsd not found in PATH.\n\
+                 Install: sudo apt install virtiofsd  (Ubuntu 23.10+)\n\
+                 Or via cargo: cargo install virtiofsd  (then add ~/.cargo/bin to PATH)\n\
+                 Or download from: https://gitlab.com/virtio-fs/virtiofsd/-/releases"
+                    .into(),
+            );
+        }
+        bin
     } else {
         None
     };
 
-    let firmware = find_efi_firmware().ok_or(
-        "EFI firmware not found.\n\
-         Install: sudo apt install ovmf  (x86_64) or sudo apt install qemu-efi-aarch64  (aarch64)\n\
-         Or: sudo apt install cloud-hypervisor  (includes CLOUDHV.fd on some distros)",
-    )?;
+    if let Some(ref bin) = ch_bin {
+        if let Err(e) = check_tap_networking(bin) {
+            preflight_errors.push(e.to_string());
+        }
+    }
+
+    if find_efi_firmware().is_none() {
+        preflight_errors.push(
+            "EFI firmware not found.\n\
+             Install: sudo apt install ovmf  (x86_64) or sudo apt install qemu-efi-aarch64  (aarch64)\n\
+             Or: sudo apt install cloud-hypervisor  (includes CLOUDHV.fd on some distros)"
+                .into(),
+        );
+    }
+
+    if !preflight_errors.is_empty() {
+        return Err(preflight_errors.join("\n\n").into());
+    }
+
+    let ch_bin = ch_bin.unwrap();
+    let firmware = find_efi_firmware().unwrap();
 
     // ── Per-session temp directory ────────────────────────────────────────────
 

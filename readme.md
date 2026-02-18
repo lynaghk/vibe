@@ -37,15 +37,22 @@ Dependencies:
 - That's it!
 
 **Linux (x86\_64 or aarch64)**
-- KVM-capable kernel (most distributions have this by default).
-- [cloud-hypervisor](https://github.com/cloud-hypervisor/cloud-hypervisor) in your `$PATH`.
-- [virtiofsd](https://gitlab.com/virtio-fs/virtiofsd) in your `$PATH` (required for directory sharing).
-- EFI firmware: install `cloud-hypervisor` or `ovmf` package from your distro.
-- A network connection is required on the first run to download and configure the Debian Linux base image.
 
-On Ubuntu/Debian:
+Install the required packages (Ubuntu/Debian):
 
     sudo apt install cloud-hypervisor virtiofsd ovmf
+
+Then do two one-time permission grants so vibe can use KVM and create TAP network interfaces without running as root:
+
+    # Allow your user to access KVM
+    sudo usermod -aG kvm $USER
+
+    # Allow cloud-hypervisor to create TAP network interfaces
+    sudo setcap cap_net_admin+ep $(which cloud-hypervisor)
+
+Then start a new shell (or run `newgrp kvm`) for the group change to take effect.
+
+A network connection is required on the first run to download and configure the Debian Linux base image.
 
 
 ## Why use Vibe?
