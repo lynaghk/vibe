@@ -1386,6 +1386,22 @@ fn ch_api_put(
     Ok(())
 }
 
+/// Extract a `/dev/pts/N` path from a cloud-hypervisor `vm.info` JSON body.
+///
+/// cloud-hypervisor reports the serial PTY path as:
+///   `"serial": { "file": "/dev/pts/N", "mode": "Pty", ... }`
+/// We scan for the prefix without a JSON parser dependency.
+#[cfg(target_os = "linux")]
+fn extract_pty_path(body: &str) -> Option<PathBuf> {
+    let pos = body.find("/dev/pts/")?;
+    let rest = &body[pos..];
+    let end = rest
+        .find(|c: char| c == '"' || c == ',' || c == '}' || c == ' ' || c == '\n')
+        .unwrap_or(rest.len());
+    let pty = rest[..end].trim();
+    if pty.is_empty() { None } else { Some(PathBuf::from(pty)) }
+}
+
 /// Wait for the cloud-hypervisor API socket to appear, then query it to get
 /// the serial console PTY path. Retries for up to START_TIMEOUT.
 #[cfg(target_os = "linux")]
@@ -1412,18 +1428,8 @@ fn wait_for_serial_pty(api_socket: &Path) -> Result<PathBuf, Box<dyn std::error:
             Err(_) => continue, // VM not ready yet
         };
 
-        // cloud-hypervisor reports the PTY path in the JSON as:
-        //   "serial": { "file": "/dev/pts/N", "mode": "Pty", ... }
-        // We scan for "/dev/pts/" to extract it without a JSON parser.
-        if let Some(pos) = body.find("/dev/pts/") {
-            let rest = &body[pos..];
-            let end = rest
-                .find(|c: char| c == '"' || c == ',' || c == '}' || c == ' ' || c == '\n')
-                .unwrap_or(rest.len());
-            let pty_path = rest[..end].trim().to_string();
-            if !pty_path.is_empty() {
-                return Ok(PathBuf::from(pty_path));
-            }
+        if let Some(path) = extract_pty_path(&body) {
+            return Ok(path);
         }
     }
 }
@@ -1700,4 +1706,173 @@ fn run_vm(
     ch_guard.0 = None; // prevent double-kill in Drop
 
     exit_result
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    // ── DirectoryShare ────────────────────────────────────────────────────────
+
+    #[test]
+    fn mount_spec_two_parts() {
+        let share = DirectoryShare::from_mount_spec("/tmp:/root/tmp").unwrap();
+        assert_eq!(share.host, PathBuf::from("/tmp"));
+        assert_eq!(share.guest, PathBuf::from("/root/tmp"));
+        assert!(!share.read_only);
+    }
+
+    #[test]
+    fn mount_spec_read_only() {
+        let share = DirectoryShare::from_mount_spec("/tmp:/root/tmp:read-only").unwrap();
+        assert!(share.read_only);
+    }
+
+    #[test]
+    fn mount_spec_read_write_explicit() {
+        let share = DirectoryShare::from_mount_spec("/tmp:/root/tmp:read-write").unwrap();
+        assert!(!share.read_only);
+    }
+
+    #[test]
+    fn mount_spec_relative_guest_becomes_absolute() {
+        let share = DirectoryShare::from_mount_spec("/tmp:myproject").unwrap();
+        assert_eq!(share.guest, PathBuf::from("/root/myproject"));
+    }
+
+    #[test]
+    fn mount_spec_too_few_parts() {
+        assert!(DirectoryShare::from_mount_spec("/tmp").is_err());
+    }
+
+    #[test]
+    fn mount_spec_too_many_parts() {
+        assert!(DirectoryShare::from_mount_spec("/tmp:/root/tmp:read-only:extra").is_err());
+    }
+
+    #[test]
+    fn mount_spec_invalid_mode() {
+        assert!(DirectoryShare::from_mount_spec("/tmp:/root/tmp:rw").is_err());
+    }
+
+    #[test]
+    fn mount_spec_nonexistent_host_errors() {
+        assert!(
+            DirectoryShare::from_mount_spec("/nonexistent_vibe_test_path:/root/x").is_err()
+        );
+    }
+
+    #[test]
+    fn tag_is_deterministic() {
+        // Uses /tmp which always exists
+        let a = DirectoryShare::from_mount_spec("/tmp:/root/tmp").unwrap();
+        let b = DirectoryShare::from_mount_spec("/tmp:/root/tmp").unwrap();
+        assert_eq!(a.tag(), b.tag());
+    }
+
+    #[test]
+    fn tag_differs_for_different_host_paths() {
+        let a = DirectoryShare::from_mount_spec("/tmp:/root/a").unwrap();
+        // /var/tmp also always exists on Linux
+        let b = DirectoryShare::from_mount_spec("/var/tmp:/root/b").unwrap();
+        assert_ne!(a.tag(), b.tag());
+    }
+
+    #[test]
+    fn tag_contains_directory_basename() {
+        let share = DirectoryShare::from_mount_spec("/tmp:/root/tmp").unwrap();
+        assert!(share.tag().starts_with("tmp_"));
+    }
+
+    // ── script_command_from_content ───────────────────────────────────────────
+
+    #[test]
+    fn script_command_embeds_content() {
+        let cmd = script_command_from_content("test", "echo hello").unwrap();
+        assert!(cmd.contains("echo hello"));
+        assert!(cmd.contains("VIBE_SCRIPT_EOF"));
+    }
+
+    #[test]
+    fn script_command_rejects_marker_collision() {
+        let err = script_command_from_content("test", "VIBE_SCRIPT_EOF").unwrap_err();
+        assert!(err.to_string().contains("marker"));
+    }
+
+    #[test]
+    fn script_command_is_executable() {
+        let cmd = script_command_from_content("myscript", "echo hi").unwrap();
+        assert!(cmd.contains("chmod +x"));
+    }
+
+    // ── motd_login_action ─────────────────────────────────────────────────────
+
+    #[test]
+    fn motd_clears_with_no_shares() {
+        let action = motd_login_action(&[]).unwrap();
+        let Send(cmd) = action else { panic!("expected Send") };
+        assert_eq!(cmd, "clear");
+    }
+
+    #[test]
+    fn motd_contains_share_paths() {
+        let share = DirectoryShare::from_mount_spec("/tmp:/root/myproject").unwrap();
+        let action = motd_login_action(&[share]).unwrap();
+        let Send(cmd) = action else { panic!("expected Send") };
+        assert!(cmd.contains("/tmp"));
+        assert!(cmd.contains("/root/myproject"));
+        assert!(cmd.contains("read-write"));
+    }
+
+    #[test]
+    fn motd_marks_read_only_shares() {
+        let share = DirectoryShare::from_mount_spec("/tmp:/root/ro:read-only").unwrap();
+        let action = motd_login_action(&[share]).unwrap();
+        let Send(cmd) = action else { panic!("expected Send") };
+        assert!(cmd.contains("read-only"));
+    }
+
+    // ── Linux: extract_pty_path ───────────────────────────────────────────────
+
+    #[cfg(target_os = "linux")]
+    mod linux {
+        use super::*;
+
+        #[test]
+        fn extract_pty_path_from_typical_api_response() {
+            let body = r#"{"config":{"serial":{"file":"/dev/pts/3","mode":"Pty"}},"state":"Running"}"#;
+            assert_eq!(
+                extract_pty_path(body),
+                Some(PathBuf::from("/dev/pts/3"))
+            );
+        }
+
+        #[test]
+        fn extract_pty_path_higher_numbered_pts() {
+            let body = r#"{"serial":{"file":"/dev/pts/42","mode":"Pty"}}"#;
+            assert_eq!(
+                extract_pty_path(body),
+                Some(PathBuf::from("/dev/pts/42"))
+            );
+        }
+
+        #[test]
+        fn extract_pty_path_missing_returns_none() {
+            let body = r#"{"state":"Running"}"#;
+            assert_eq!(extract_pty_path(body), None);
+        }
+
+        #[test]
+        fn extract_pty_path_stops_at_quote() {
+            // Make sure we don't over-read past the closing quote
+            let body = r#""/dev/pts/7","other":"stuff""#;
+            assert_eq!(
+                extract_pty_path(body),
+                Some(PathBuf::from("/dev/pts/7"))
+            );
+        }
+    }
 }
