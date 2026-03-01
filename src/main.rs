@@ -41,6 +41,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_EXPECT_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_EXPECT_TIMEOUT: Duration = Duration::from_secs(120);
 const PROVISION_SCRIPT: &str = include_str!("provision.sh");
+const VIBE_GITIGNORE: &str = "# created by vibe automatically\n*\n";
 
 #[derive(Clone)]
 enum LoginAction {
@@ -611,7 +612,9 @@ fn ensure_instance_disk(
     }
 
     println!("Creating instance disk from {}...", template_raw.display());
-    std::fs::create_dir_all(instance_raw.parent().unwrap())?;
+    let instance_dir = instance_raw.parent().unwrap();
+    std::fs::create_dir_all(instance_dir)?;
+    fs::write(instance_dir.join(".gitignore"), VIBE_GITIGNORE)?;
     fs::copy(template_raw, instance_raw)?;
     Ok(())
 }
