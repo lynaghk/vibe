@@ -29,6 +29,9 @@ hostnamectl set-hostname vibe
 # Set this env var so claude doesn't complain about running as root.'
 echo "export IS_SANDBOX=1" >> .bashrc
 
+# Set this environment variable to prevent the Gemini CLI from failing to identify the sandbox command
+echo "export GEMINI_SANDBOX=false" >> .bashrc
+
 # Shutdown the VM when you logout
 cat > .bash_logout <<EOF
 systemctl poweroff
