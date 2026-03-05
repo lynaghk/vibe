@@ -1,5 +1,5 @@
 #!/bin/bash
-set -eux
+set -euxo pipefail
 
 # Don't wait too long for slow mirrors.
 echo 'Acquire::http::Timeout "2";' | tee /etc/apt/apt.conf.d/99timeout
@@ -35,8 +35,16 @@ echo "export GEMINI_SANDBOX=false" >> .bashrc
 # Enable true color support in the terminal
 echo "export COLORTERM=truecolor" >> .bashrc
 
+# Hide commands beginning with space from the history
+echo "export HISTCONTROL=ignorespace" >> .bashrc
+
+# Unlimited bash history
+echo "export HISTFILESIZE=" >> .bashrc
+echo "export HISTSIZE=" >> .bashrc
+
 # Shutdown the VM when you logout
 cat > .bash_logout <<EOF
+history -w # Write bash history. Otherwise bash would be killed by poweroff without having written history
 systemctl poweroff
 sleep 100 # sleep here so that we don't see the login screen flash up before the shutdown.
 EOF
