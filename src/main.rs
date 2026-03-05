@@ -208,14 +208,14 @@ Options
     let mut directory_shares = Vec::new();
 
     if !args.no_default_mounts {
-        login_actions.push(Send(format!("cd {project_name}")));
+        login_actions.push(Send(format!(" cd {project_name}")));
 
         // Discourage read/write of project dir subfolders within the VM.
         // Note that this isn't secure, since the VM runs as root and could unmount this.
         // I couldn't find an alternative way to do this --- the MacOS sandbox doesn't apply to the Apple Virtualization system =(
         for subfolder in [".git", ".vibe"] {
             if project_root.join(subfolder).exists() {
-                login_actions.push(Send(format!(r"mount -t tmpfs tmpfs {}", subfolder)))
+                login_actions.push(Send(format!(r" mount -t tmpfs tmpfs {}", subfolder)))
             }
         }
 
@@ -249,7 +249,7 @@ Options
         }
         // Bind-mount linux ripgrep over shared macos binary to ensure compatibility
         login_actions.push(Send(
-            "if [ -f /root/.gemini/tmp/bin/rg ] && [ -f /usr/bin/rg ]; then mount --bind /usr/bin/rg /root/.gemini/tmp/bin/rg; fi"
+            " if [ -f /root/.gemini/tmp/bin/rg ] && [ -f /usr/bin/rg ]; then mount --bind /usr/bin/rg /root/.gemini/tmp/bin/rg; fi"
                 .to_string()
         ));
     }
@@ -257,6 +257,9 @@ Options
     for spec in &args.mounts {
         directory_shares.push(DirectoryShare::from_mount_spec(spec)?);
     }
+
+    // Enable bash history
+    login_actions.push(Send(" export HISTFILE=/root/.bash_history".to_string()));
 
     if let Some(motd_action) = motd_login_action(&directory_shares) {
         login_actions.push(motd_action);
@@ -383,7 +386,7 @@ fn script_command_from_content(
     let guest_dir = "/tmp/vibe-scripts";
     let guest_path = format!("{guest_dir}/{label}.sh");
     let command = format!(
-        "mkdir -p {guest_dir}\ncat >{guest_path} <<'{marker}'\n{script}\n{marker}\nchmod +x {guest_path}\n{guest_path}"
+        " mkdir -p {guest_dir}\ncat >{guest_path} <<'{marker}'\n{script}\n{marker}\nchmod +x {guest_path}\n {guest_path}"
     );
     if script.contains(marker) {
         return Err(
@@ -395,7 +398,7 @@ fn script_command_from_content(
 
 fn motd_login_action(directory_shares: &[DirectoryShare]) -> Option<LoginAction> {
     if directory_shares.is_empty() {
-        return Some(Send("clear".into()));
+        return Some(Send(" clear".into()));
     }
 
     let host_header = "Host";
@@ -454,7 +457,7 @@ fn motd_login_action(directory_shares: &[DirectoryShare]) -> Option<LoginAction>
         ));
     }
 
-    let command = format!("clear && cat <<'VIBE_MOTD'\n{output}\nVIBE_MOTD");
+    let command = format!(" clear && cat <<'VIBE_MOTD'\n{output}\nVIBE_MOTD");
     Some(Send(command))
 }
 
@@ -1117,29 +1120,32 @@ fn run_vm(
             text: "~#".to_string(),
             timeout: LOGIN_EXPECT_TIMEOUT,
         },
+        // Temporarily disable bash history and set commands starting with space to be ignored
+        Send(" export HISTCONTROL=ignorespace".to_string()),
+        Send(" unset HISTFILE".to_string()),
         // Our terminal is connected via /dev/hvc0 which Debian apparently keeps barebones.
         // We want sane terminal defaults like icrnl (translating carriage returns into newlines)
-        Send("stty -F /dev/hvc0 sane".to_string()),
+        Send(" stty -F /dev/hvc0 sane".to_string()),
         // In background, continuously read host terminal resizes sent over hvc1 and update hvc0.
         Send({
             // sorry for this nonsense, the string is so long it angers rustfmt =(
-            const S: &str = "sh -c '(while IFS=\" \" read -r rows cols; do stty -F /dev/hvc0 rows \"$rows\" cols \"$cols\"; done) < /dev/hvc1 >/dev/null 2>&1 &'";
+            const S: &str = " sh -c '(while IFS=\" \" read -r rows cols; do stty -F /dev/hvc0 rows \"$rows\" cols \"$cols\"; done) < /dev/hvc1 >/dev/null 2>&1 &'";
             S.to_string()
         }),
     ];
 
     if !directory_shares.is_empty() {
-        all_login_actions.push(Send("mkdir -p /mnt/shared".into()));
+        all_login_actions.push(Send(" mkdir -p /mnt/shared".into()));
         all_login_actions.push(Send(format!(
-            "mount -t virtiofs {} /mnt/shared",
+            " mount -t virtiofs {} /mnt/shared",
             SHARED_DIRECTORIES_TAG
         )));
 
         for share in directory_shares {
             let staging = format!("/mnt/shared/{}", share.tag());
             let guest = share.guest.to_string_lossy();
-            all_login_actions.push(Send(format!("mkdir -p {}", guest)));
-            all_login_actions.push(Send(format!("mount --bind {} {}", staging, guest)));
+            all_login_actions.push(Send(format!(" mkdir -p {}", guest)));
+            all_login_actions.push(Send(format!(" mount --bind {} {}", staging, guest)));
         }
     }
 
