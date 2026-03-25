@@ -7,15 +7,21 @@ on:
   push:
     branches: [main]
 
+  # need this so I can trigger builds manually via website
+  workflow_dispatch:
+
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-15
 
     steps:
       - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install vmnet-helper requirements
+        run: brew install meson ninja
 
       - name: Build release binary
         run: cargo build --release
@@ -32,6 +38,7 @@ jobs:
           zip vibe-macos-arm64.zip vibe
 
       - name: Create sha release
+        if: github.ref == 'refs/heads/main'
         run: |
           gh release create "${{ env.BUILD_DATE }}-${{ env.SHA_SHORT }}" \
             --title "${{ env.BUILD_DATE }}-${{ env.SHA_SHORT }}" \
@@ -41,11 +48,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Delete existing latest release
+        if: github.ref == 'refs/heads/main'
         run: gh release delete latest --cleanup-tag --yes || true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create latest release
+        if: github.ref == 'refs/heads/main'
         run: |
           gh release create latest \
             --title "Latest" \
