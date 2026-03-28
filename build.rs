@@ -34,22 +34,18 @@ fn build_vmnet_helper(manifest_dir: &Path, out_dir: &Path) -> PathBuf {
         &config_template.replace("@PREFIX@", "/opt/vmnet-helper"),
     );
 
-    let git_commit = String::from_utf8(
-        Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(manifest_dir)
-            .output()
-            .expect("run git rev-parse HEAD")
-            .stdout,
-    )
-    .expect("git rev-parse HEAD returned invalid UTF-8")
-    .trim()
-    .to_owned();
+    let sha = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&vmnet_dir)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap();
+
     // Use only the commit hash in the generated header so the helper build does
     // not depend on tag state in the local clone.
     write_if_changed(
         &version_h,
-        &format!("#define GIT_VERSION \"{git_commit}\"\n#define GIT_COMMIT  \"{git_commit}\"\n"),
+        &format!("#define GIT_VERSION \"{sha}\"\n#define GIT_COMMIT  \"{sha}\"\n"),
     );
 
     let mut clang = Command::new("clang");
@@ -72,9 +68,6 @@ fn build_vmnet_helper(manifest_dir: &Path, out_dir: &Path) -> PathBuf {
         .arg("helper.c")
         .arg("options.c")
         .arg("vmnet-broker/client.c")
-        // Suppress a linker-generated Mach-O UUID so identical inputs can
-        // produce identical helper binaries on the same toolchain/SDK.
-        .arg("-Wl,-no_uuid")
         .args(["-framework", "vmnet"])
         .args(["-framework", "CoreFoundation"])
         .arg("-o")
