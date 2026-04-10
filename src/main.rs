@@ -6,6 +6,7 @@ use std::{
     os::{
         fd::RawFd,
         unix::{
+            fs::OpenOptionsExt,
             io::{AsRawFd, IntoRawFd, OwnedFd},
             net::UnixStream,
             process::CommandExt,
@@ -27,6 +28,8 @@ use lexopt::prelude::*;
 use objc2::{AnyThread, rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::*;
 use objc2_virtualization::*;
+use single_instance::SingleInstance;
+use ssh_key::{Algorithm, PrivateKey, rand_core::OsRng};
 
 mod networking;
 use networking::*;
@@ -46,9 +49,10 @@ const PROVISION_SCRIPT: &str = include_str!("provision.sh");
 
 #[derive(Clone)]
 enum LoginAction {
-    Expect { text: String, timeout: Duration },
+    Expect { text: String, timeout: Duration, },
+    CaptureTextToFile { start: String, end: String, to_file: PathBuf, timeout: Duration, },
     Send(String),
-    Script { path: PathBuf, index: usize },
+    Script { path: PathBuf, index: usize, },
 }
 use LoginAction::*;
 
@@ -117,7 +121,111 @@ impl DirectoryShare {
     }
 }
 
+fn ssh(instance_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let instance_ip_file = instance_dir.join("instance.ip");
+    let privkey = instance_dir.join("id_ed25519");
+    let pubkey = instance_dir.join("id_ed25519.pub");
+
+    if !instance_ip_file.exists() {
+        return Err(format!(
+            "Instance ip file does not exist: {}",
+            instance_ip_file.display()
+        )
+        .into());
+    }
+
+    if !privkey.exists() {
+        return Err(format!("SSH private key file does not exist: {}", privkey.display()).into());
+    }
+
+    if !pubkey.exists() {
+        return Err(format!("SSH public key file does not exist: {}", pubkey.display()).into());
+    }
+
+    let instance_ip = fs::read_to_string(instance_ip_file)?;
+
+    println!("SSH-ing into VM...");
+    let mut args: Vec<&str> = Vec::new();
+    args.push("-i");
+    args.push(privkey.to_str().unwrap());
+
+    for opt in [
+        "GlobalKnownHostsFile=/dev/null",
+        "UserKnownHostsFile=/dev/null",
+        "StrictHostKeyChecking=no",
+        "LogLevel=ERROR",
+    ] {
+        args.push("-o");
+        args.push(opt);
+    }
+
+    let user_instance_ip = format!("root@{instance_ip}");
+    args.push(&user_instance_ip);
+
+    let project_name = &env::current_dir()?
+        .file_name()
+        .ok_or("Project directory has no name")?
+        .to_string_lossy()
+        .into_owned();
+    let ssh_args: Vec<String> = Vec::from_iter(
+        env::args_os()
+            .skip(1)
+            .map(|x| return x.into_string().unwrap()),
+    );
+    let mut ssh_args2: Vec<&str> = ssh_args.iter().map(|s| &**s).collect();
+    let mut cd_shell = String::new();
+    args.push("-t");
+    if ssh_args2.len() == 0 {
+        // create a login shell in our subfolder
+        cd_shell.push_str(&format!(" cd {} && bash --login", project_name));
+        args.push(&cd_shell);
+    } else {
+        // cd into our subfolder before executing given commands
+        cd_shell.push_str(&format!(" cd {} && ", project_name));
+        args.push(&cd_shell);
+        args.append(&mut ssh_args2);
+    }
+
+    let result = Command::new("ssh")
+        .args(args)
+        .status()
+        .expect("failed to execute process");
+    if result.success() {
+        Ok(())
+    } else {
+        let exit_code = result.code();
+        if exit_code.is_some() {
+            Err(Box::from(format!(
+                "ssh exited with {}",
+                exit_code.unwrap().to_string()
+            )))
+        } else {
+            Err(Box::from("ssh exited with unknown exit code"))
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ensure_signed();
+
+    let project_root = env::current_dir()?;
+    let instance_dir = project_root.join(".vibe");
+
+    if !instance_dir.exists() {
+        fs::create_dir_all(project_root.join(".vibe")).expect("Could not create .vibe folder");
+    }
+
+    // ssh into VM if an instance is already running
+    let instance_lock = instance_dir.join("instance.lock");
+    if !instance_lock.exists() {
+        fs::write(instance_lock, "").expect("Could not write lock file .vibe/instance.lock");
+    }
+    let lock_name = fs::canonicalize(instance_dir.join("instance.lock"))?;
+    let instance = SingleInstance::new(lock_name.to_str().unwrap())?;
+    if !instance.is_single() {
+        return ssh(instance_dir);
+    }
+
     let args = parse_cli()?;
 
     if args.version {
@@ -216,6 +324,32 @@ Options
 
     let mut login_actions = Vec::new();
     let mut directory_shares = Vec::new();
+
+    // Generate ssh keypair. Save to host .vibe/id_ed25519 and .vibe/id_ed25519.pub
+    let private_key_path = instance_dir.join("id_ed25519");
+    let public_key_path = instance_dir.join("id_ed25519.pub");
+    if !private_key_path.exists() || !public_key_path.exists() {
+        let private_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?;
+        let public_key = private_key.public_key();
+        let privkey = private_key.to_openssh(base64ct::LineEnding::LF)?;
+        let pubkey_str = public_key.to_openssh()?.to_string();
+        fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .mode(0o600)
+            .open(private_key_path)
+            .expect("Could not create private ssh key .vibe/id_ed25519")
+            .write_all(privkey.as_bytes())
+            .expect("Could not write private ssh key .vibe/id_ed25519");
+        fs::write(public_key_path, pubkey_str)
+            .expect("Could not write public ssh key .vibe/id_ed25519.pub");
+    }
+
+    // Write public key to guest instance
+    let pubkey_str = fs::read_to_string(instance_dir.join("id_ed25519.pub"))?;
+    login_actions.push(Send(format!(
+        " echo '{pubkey_str}' > ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+    )));
 
     if !args.no_default_mounts {
         login_actions.push(Send(format!(" cd {project_name}")));
@@ -526,6 +660,32 @@ impl OutputMonitor {
             WaitResult::Timeout
         } else {
             WaitResult::Found
+        }
+    }
+
+    fn wait_for_start_end(&self, start: &str, end: &str, timeout: Duration) -> Option<String> {
+        let mut x = String::new();
+        let (_unused, timeout_result) = self
+            .condvar
+            .wait_timeout_while(self.buffer.lock().unwrap(), timeout, |buf| {
+                if let Some((_, remaining)) = buf.split_once(start) {
+                    if let Some((matched, remaining2)) = remaining.split_once(end) {
+                        x = matched.to_string();
+                        *buf = remaining2.to_string();
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                }
+            })
+            .unwrap();
+
+        if timeout_result.timed_out() {
+            None
+        } else {
+            Some(x)
         }
     }
 }
@@ -1053,6 +1213,26 @@ fn spawn_login_actions_thread(
                         return;
                     }
                 }
+                CaptureTextToFile {
+                    start: begin,
+                    end,
+                    to_file,
+                    timeout,
+                } => {
+                    let res = output_monitor.wait_for_start_end(&begin, &end, timeout);
+                    match res {
+                        Some(p) => {
+                            fs::write(to_file, p).expect("Could not write to file");
+                        }
+                        None => {
+                            let _ = vm_output_tx.send(VmOutput::LoginActionTimeout {
+                                action: format!("expect '{}' ... '{}'", begin, end),
+                                timeout,
+                            });
+                            return;
+                        }
+                    }
+                }
                 Send(mut text) => {
                     text.push('\n'); // Type the newline so the command is actually submitted.
                     input_tx.send(VmInput::Bytes(text.into_bytes())).unwrap();
@@ -1168,6 +1348,14 @@ fn run_vm(
         // Our terminal is connected via /dev/hvc0 which Debian apparently keeps barebones.
         // We want sane terminal defaults like icrnl (translating carriage returns into newlines)
         Send(" stty -F /dev/hvc0 sane".to_string()),
+        // Grab the IP address of the VM and write it to .vibe/instance.ip
+        Send(" echo \"VM IP\"\": $(hostname -I | cut -d ' ' -f1)\"".to_string()),
+        CaptureTextToFile {
+            start: "VM IP: ".to_string(),
+            end: "\r".to_string(), // apparantly \r is emitted for newline
+            to_file: env::current_dir()?.join(".vibe").join("instance.ip"),
+            timeout: DEFAULT_EXPECT_TIMEOUT,
+        },
         // In background, continuously read host terminal resizes sent over hvc1 and update hvc0.
         Send({
             // sorry for this nonsense, the string is so long it angers rustfmt =(
