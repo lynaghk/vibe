@@ -262,6 +262,18 @@ Options
             " if [ -f /root/.gemini/tmp/bin/rg ] && [ -f /usr/bin/rg ]; then mount --bind /usr/bin/rg /root/.gemini/tmp/bin/rg; fi"
                 .to_string()
         ));
+
+        // Symlink the host home directory path to /root so that absolute paths baked
+        // into plugin/tool configs (e.g. ~/.claude/plugins/installed_plugins.json) resolve
+        // correctly inside the VM without needing to rewrite any config files.
+        login_actions.push(Send(format!(
+            " mkdir -p {parent} && ln -sfn /root {home}",
+            parent = home
+                .parent()
+                .map(|p| p.to_string_lossy())
+                .unwrap_or("/".into()),
+            home = home.to_string_lossy(),
+        )));
     }
 
     for spec in &args.mounts {
