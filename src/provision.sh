@@ -14,6 +14,7 @@ apt-get install -y --no-install-recommends      \
         libssl-dev                              \
         curl                                    \
         git                                     \
+        tmux                                    \
         ripgrep
 
 
@@ -45,8 +46,12 @@ echo "export HISTSIZE=" >> .bashrc
 # Shutdown the VM when you logout
 cat > .bash_logout <<EOF
 history -w # Write bash history. Otherwise bash would be killed by poweroff without having written history
-systemctl poweroff
-sleep 100 # sleep here so that we don't see the login screen flash up before the shutdown.
+
+# Only shutdown if tmux isn't running
+if ! tmux list-sessions &> /dev/null; then
+    systemctl poweroff
+    sleep 100 # sleep here so that we don't see the login screen flash up before the shutdown.
+fi
 EOF
 
 
