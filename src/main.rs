@@ -8,7 +8,7 @@ use std::{
         unix::{
             fs::OpenOptionsExt,
             io::{AsRawFd, IntoRawFd, OwnedFd},
-            net::UnixStream,
+            net::{UnixListener, UnixStream},
             process::CommandExt,
         },
     },
@@ -132,87 +132,232 @@ impl DirectoryShare {
     }
 }
 
-fn ssh(instance_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let instance_ip_file = instance_dir.join("instance.ip");
-    let privkey = instance_dir.join("id_ed25519");
-    let pubkey = instance_dir.join("id_ed25519.pub");
+fn attach_console(instance_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let socket_path = instance_dir.join("console.sock");
 
-    if !instance_ip_file.exists() {
+    if !socket_path.exists() {
         return Err(format!(
-            "Instance ip file does not exist: {}",
-            instance_ip_file.display()
+            "No VM console socket found at {}. Is the VM running?",
+            socket_path.display()
         )
         .into());
     }
 
-    if !privkey.exists() {
-        return Err(format!("SSH private key file does not exist: {}", privkey.display()).into());
-    }
+    let stream = UnixStream::connect(&socket_path)?;
+    let stream_fd = stream.as_raw_fd();
+    let _stream = stream;
 
-    if !pubkey.exists() {
-        return Err(format!("SSH public key file does not exist: {}", pubkey.display()).into());
-    }
-
-    let instance_ip = fs::read_to_string(instance_ip_file)?;
-
-    println!("SSH-ing into VM...");
-    let mut args: Vec<&str> = Vec::new();
-    args.push("-i");
-    args.push(privkey.to_str().unwrap());
-
-    for opt in [
-        "GlobalKnownHostsFile=/dev/null",
-        "UserKnownHostsFile=/dev/null",
-        "StrictHostKeyChecking=no",
-        "LogLevel=ERROR",
-    ] {
-        args.push("-o");
-        args.push(opt);
-    }
-
-    let user_instance_ip = format!("root@{instance_ip}");
-    args.push(&user_instance_ip);
-
-    let abspath = env::current_dir()?
-        .into_os_string()
-        .to_string_lossy()
-        .into_owned();
-    let ssh_args: Vec<String> = Vec::from_iter(
-        env::args_os()
-            .skip(1)
-            .map(|x| return x.into_string().unwrap()),
-    );
-    let mut ssh_args2: Vec<&str> = ssh_args.iter().map(|s| &**s).collect();
-    let mut cd_shell = String::new();
-    args.push("-t");
-    if ssh_args2.len() == 0 {
-        // create a login shell in our subfolder
-        cd_shell.push_str(&format!(" cd {} && bash --login", abspath));
-        args.push(&cd_shell);
-    } else {
-        // cd into our subfolder before executing given commands
-        cd_shell.push_str(&format!(" cd {} && ", abspath));
-        args.push(&cd_shell);
-        args.append(&mut ssh_args2);
-    }
-
-    let result = Command::new("ssh")
-        .args(args)
-        .status()
-        .expect("failed to execute process");
-    if result.success() {
-        Ok(())
-    } else {
-        let exit_code = result.code();
-        if exit_code.is_some() {
-            Err(Box::from(format!(
-                "ssh exited with {}",
-                exit_code.unwrap().to_string()
-            )))
-        } else {
-            Err(Box::from("ssh exited with unknown exit code"))
+    // Send terminal resize events to hvc3 (same protocol as hvc0/hvc1).
+    let resize_socket_path = instance_dir.join("console-resize.sock");
+    if resize_socket_path.exists() {
+        if let Ok(mut resize_stream) = UnixStream::connect(&resize_socket_path) {
+            let _ = thread::spawn(move || loop {
+                if let Some((rows, cols)) = terminal_size(libc::STDOUT_FILENO) {
+                    let msg = format!("{rows} {cols}\n");
+                    if resize_stream.write_all(msg.as_bytes()).is_err() {
+                        break;
+                    }
+                }
+                thread::sleep(Duration::from_millis(200));
+            });
         }
     }
+
+    let _raw = enable_raw_mode(libc::STDIN_FILENO)
+        .map_err(|e| format!("Failed to enable raw mode: {e}"))?;
+
+    let mut buf = [0u8; 4096];
+    loop {
+        let mut fds = [
+            libc::pollfd {
+                fd: libc::STDIN_FILENO,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stream_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+
+        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        if ret < 0 {
+            break;
+        }
+
+        if fds[0].revents & libc::POLLIN != 0 {
+            let n =
+                unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            if unsafe { libc::write(stream_fd, buf.as_ptr() as *const _, n as usize) } < 0 {
+                break;
+            }
+        }
+
+        if fds[1].revents & libc::POLLIN != 0 {
+            let n = unsafe { libc::read(stream_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(&buf[..n as usize])?;
+            stdout.flush()?;
+        }
+
+        if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            break;
+        }
+        if fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn spawn_console_socket_proxy(hvc_out: OwnedFd, hvc_in: OwnedFd, socket_path: PathBuf) {
+    let _ = thread::spawn(move || {
+        let _ = fs::remove_file(&socket_path);
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("[console] Failed to bind socket: {e}");
+                return;
+            }
+        };
+
+        let hvc_out_fd = hvc_out.as_raw_fd();
+        let hvc_in_fd = hvc_in.as_raw_fd();
+        let _hvc_out = hvc_out;
+        let _hvc_in = hvc_in;
+        let listener_fd = listener.as_raw_fd();
+
+        loop {
+            // Blocking accept: wait for the next client.
+            let (stream, _) = match listener.accept() {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+
+            // While serving this client, switch to non-blocking accept so new connections
+            // can be rejected immediately rather than queuing silently.
+            let _ = listener.set_nonblocking(true);
+
+            let client_fd = stream.as_raw_fd();
+            let _stream = stream;
+            let mut buf = [0u8; 4096];
+
+            'client: loop {
+                let mut fds = [
+                    libc::pollfd {
+                        fd: hvc_out_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: client_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: listener_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+
+                let ret = unsafe { libc::poll(fds.as_mut_ptr(), 3, -1) };
+                if ret < 0 {
+                    break 'client;
+                }
+
+                // New connection while busy: drain the accept queue and reject each one.
+                if fds[2].revents & libc::POLLIN != 0 {
+                    while let Ok((mut new_stream, _)) = listener.accept() {
+                        let _ = new_stream.write_all(b"console is already attached\r\n");
+                    }
+                }
+
+                if fds[0].revents & libc::POLLIN != 0 {
+                    let n = unsafe {
+                        libc::read(hvc_out_fd, buf.as_mut_ptr() as *mut _, buf.len())
+                    };
+                    if n <= 0 {
+                        return; // VM console gone
+                    }
+                    if unsafe { libc::write(client_fd, buf.as_ptr() as *const _, n as usize) } < 0
+                    {
+                        break 'client; // client disconnected
+                    }
+                }
+
+                if fds[1].revents & libc::POLLIN != 0 {
+                    let n =
+                        unsafe { libc::read(client_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+                    if n <= 0 {
+                        break 'client; // client disconnected
+                    }
+                    if unsafe {
+                        libc::write(hvc_in_fd, buf.as_ptr() as *const _, n as usize)
+                    } < 0
+                    {
+                        return; // VM console gone
+                    }
+                }
+
+                if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                    return;
+                }
+                if fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                    break 'client;
+                }
+            }
+
+            // Restore blocking mode so the next accept() at the top of the loop blocks.
+            let _ = listener.set_nonblocking(false);
+        }
+    });
+}
+
+fn spawn_console_resize_proxy(hvc_in: OwnedFd, socket_path: PathBuf) {
+    let _ = thread::spawn(move || {
+        let _ = fs::remove_file(&socket_path);
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("[console resize] Failed to bind socket: {e}");
+                return;
+            }
+        };
+
+        let hvc_in_fd = hvc_in.as_raw_fd();
+        let _hvc_in = hvc_in;
+
+        loop {
+            let (stream, _) = match listener.accept() {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+
+            let client_fd = stream.as_raw_fd();
+            let _stream = stream;
+            let mut buf = [0u8; 64];
+
+            loop {
+                let n =
+                    unsafe { libc::read(client_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+                if n <= 0 {
+                    break; // client disconnected, wait for next
+                }
+                if unsafe { libc::write(hvc_in_fd, buf.as_ptr() as *const _, n as usize) } < 0 {
+                    return; // VM gone
+                }
+            }
+        }
+    });
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -233,7 +378,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let lock_name = fs::canonicalize(instance_dir.join("instance.lock"))?;
     let instance = SingleInstance::new(lock_name.to_str().unwrap())?;
     if !instance.is_single() {
-        return ssh(instance_dir);
+        return attach_console(instance_dir);
     }
 
     let args = parse_cli()?;
@@ -440,6 +585,7 @@ Options
         prepare_network_backend,
         args.cpu_count,
         args.ram_bytes,
+        Some(instance_dir.join("console.sock")),
     )
 }
 
@@ -806,6 +952,7 @@ fn ensure_default_image(
         prepare_network_backend,
         DEFAULT_CPU_COUNT,
         DEFAULT_RAM_BYTES,
+        None,
     )?;
 
     Ok(())
@@ -1034,6 +1181,9 @@ fn create_vm_configuration(
     vm_reads_from_fd: OwnedFd,
     vm_writes_to_fd: OwnedFd,
     resize_reads_from_fd: OwnedFd,
+    console_reads_from_fd: Option<OwnedFd>,
+    console_writes_to_fd: Option<OwnedFd>,
+    console_resize_reads_from_fd: Option<OwnedFd>,
     cpu_count: usize,
     ram_bytes: u64,
 ) -> Result<Retained<VZVirtualMachineConfiguration>, Box<dyn std::error::Error>> {
@@ -1180,12 +1330,58 @@ fn create_vm_configuration(
             let resize_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
             resize_port.setAttachment(Some(&resize_attach));
 
-            let serial_ports: Retained<NSArray<_>> = NSArray::from_retained_slice(&[
-                Retained::into_super(serial_port),
-                Retained::into_super(resize_port),
-            ]);
+            if let (Some(console_reads), Some(console_writes), Some(console_resize_reads)) = (
+                console_reads_from_fd,
+                console_writes_to_fd,
+                console_resize_reads_from_fd,
+            ) {
+                let console_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+                    NSFileHandle::alloc(),
+                    console_reads.into_raw_fd(),
+                    true,
+                );
+                let console_write_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+                    NSFileHandle::alloc(),
+                    console_writes.into_raw_fd(),
+                    true,
+                );
+                let console_attach =
+                    VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                        VZFileHandleSerialPortAttachment::alloc(),
+                        Some(&console_read_handle),
+                        Some(&console_write_handle),
+                    );
+                let console_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
+                console_port.setAttachment(Some(&console_attach));
 
-            config.setSerialPorts(&serial_ports);
+                let console_resize_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+                    NSFileHandle::alloc(),
+                    console_resize_reads.into_raw_fd(),
+                    true,
+                );
+                let console_resize_attach =
+                    VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                        VZFileHandleSerialPortAttachment::alloc(),
+                        Some(&console_resize_read_handle),
+                        None,
+                    );
+                let console_resize_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
+                console_resize_port.setAttachment(Some(&console_resize_attach));
+
+                let serial_ports: Retained<NSArray<_>> = NSArray::from_retained_slice(&[
+                    Retained::into_super(serial_port),
+                    Retained::into_super(resize_port),
+                    Retained::into_super(console_port),
+                    Retained::into_super(console_resize_port),
+                ]);
+                config.setSerialPorts(&serial_ports);
+            } else {
+                let serial_ports: Retained<NSArray<_>> = NSArray::from_retained_slice(&[
+                    Retained::into_super(serial_port),
+                    Retained::into_super(resize_port),
+                ]);
+                config.setSerialPorts(&serial_ports);
+            }
         }
 
         ////////////////////////////
@@ -1282,10 +1478,33 @@ fn run_vm(
     prepare_network_backend: impl Fn() -> PreparedNetworkBackend,
     cpu_count: usize,
     ram_bytes: u64,
+    console_socket_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (vm_reads_from, we_write_to) = create_pipe();
     let (we_read_from, vm_writes_to) = create_pipe();
     let (resize_reads_from, we_write_resize_to) = create_pipe();
+    let (
+        console_reads_from,
+        console_writes_to,
+        we_read_console,
+        we_write_console,
+        console_resize_reads_from,
+        we_write_console_resize,
+    ) = if console_socket_path.is_some() {
+        let (reads_from, we_write) = create_pipe();
+        let (we_read, writes_to) = create_pipe();
+        let (resize_reads_from, we_write_resize) = create_pipe();
+        (
+            Some(reads_from),
+            Some(writes_to),
+            Some(we_read),
+            Some(we_write),
+            Some(resize_reads_from),
+            Some(we_write_resize),
+        )
+    } else {
+        (None, None, None, None, None, None)
+    };
     let mut prepared_network_backend = prepare_network_backend();
     let config = create_vm_configuration(
         disk_path,
@@ -1294,6 +1513,9 @@ fn run_vm(
         vm_reads_from,
         vm_writes_to,
         resize_reads_from,
+        console_reads_from,
+        console_writes_to,
+        console_resize_reads_from,
         cpu_count,
         ram_bytes,
     )?;
@@ -1344,6 +1566,16 @@ fn run_vm(
     }
 
     println!("VM booting...");
+
+    if let (Some(path), Some(out), Some(inp)) =
+        (console_socket_path.as_ref(), we_read_console, we_write_console)
+    {
+        spawn_console_socket_proxy(out, inp, path.clone());
+    }
+    if let (Some(path), Some(inp)) = (console_socket_path.as_ref(), we_write_console_resize) {
+        let resize_path = path.with_file_name("console-resize.sock");
+        spawn_console_resize_proxy(inp, resize_path);
+    }
 
     let output_monitor = Arc::new(OutputMonitor::default());
     let io_ctx = spawn_vm_io(
@@ -1397,6 +1629,20 @@ fn run_vm(
             let guest = share.guest.to_string_lossy();
             all_login_actions.push(Send(format!(" mkdir -p {}", guest)));
             all_login_actions.push(Send(format!(" mount --bind {} {}", staging, guest)));
+        }
+    }
+
+    if console_socket_path.is_some() {
+        // agetty writes a utmp entry (needed for `who`) and sets up the terminal properly,
+        // including making hvc2 the controlling terminal of a new session.
+        // --local-line suppresses modem-control/baud-rate detection for a virtual device.
+        all_login_actions.push(Send(
+            " (while true; do agetty --autologin root --noclear --local-line hvc2 xterm-256color; done) &".to_string(),
+        ));
+        // Read resize events from hvc3 and apply them to hvc2 (mirrors hvc0/hvc1).
+        {
+            const S: &str = " sh -c '(while IFS=\" \" read -r rows cols; do stty -F /dev/hvc2 rows \"$rows\" cols \"$cols\"; done) < /dev/hvc3 >/dev/null 2>&1 &'";
+            all_login_actions.push(Send(S.to_string()));
         }
     }
 
@@ -1458,6 +1704,11 @@ fn run_vm(
     let _ = login_actions_thread.join();
 
     io_ctx.shutdown();
+
+    if let Some(ref path) = console_socket_path {
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(path.with_file_name("console-resize.sock"));
+    }
 
     exit_result
 }
