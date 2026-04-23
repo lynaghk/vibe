@@ -151,14 +151,16 @@ fn attach_console(instance_dir: PathBuf) -> Result<(), Box<dyn std::error::Error
     let resize_socket_path = instance_dir.join("console-resize.sock");
     if resize_socket_path.exists() {
         if let Ok(mut resize_stream) = UnixStream::connect(&resize_socket_path) {
-            let _ = thread::spawn(move || loop {
-                if let Some((rows, cols)) = terminal_size(libc::STDOUT_FILENO) {
-                    let msg = format!("{rows} {cols}\n");
-                    if resize_stream.write_all(msg.as_bytes()).is_err() {
-                        break;
+            let _ = thread::spawn(move || {
+                loop {
+                    if let Some((rows, cols)) = terminal_size(libc::STDOUT_FILENO) {
+                        let msg = format!("{rows} {cols}\n");
+                        if resize_stream.write_all(msg.as_bytes()).is_err() {
+                            break;
+                        }
                     }
+                    thread::sleep(Duration::from_millis(200));
                 }
-                thread::sleep(Duration::from_millis(200));
             });
         }
     }
@@ -282,28 +284,22 @@ fn spawn_console_socket_proxy(hvc_out: OwnedFd, hvc_in: OwnedFd, socket_path: Pa
                 }
 
                 if fds[0].revents & libc::POLLIN != 0 {
-                    let n = unsafe {
-                        libc::read(hvc_out_fd, buf.as_mut_ptr() as *mut _, buf.len())
-                    };
+                    let n =
+                        unsafe { libc::read(hvc_out_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
                     if n <= 0 {
                         return; // VM console gone
                     }
-                    if unsafe { libc::write(client_fd, buf.as_ptr() as *const _, n as usize) } < 0
-                    {
+                    if unsafe { libc::write(client_fd, buf.as_ptr() as *const _, n as usize) } < 0 {
                         break 'client; // client disconnected
                     }
                 }
 
                 if fds[1].revents & libc::POLLIN != 0 {
-                    let n =
-                        unsafe { libc::read(client_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+                    let n = unsafe { libc::read(client_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
                     if n <= 0 {
                         break 'client; // client disconnected
                     }
-                    if unsafe {
-                        libc::write(hvc_in_fd, buf.as_ptr() as *const _, n as usize)
-                    } < 0
-                    {
+                    if unsafe { libc::write(hvc_in_fd, buf.as_ptr() as *const _, n as usize) } < 0 {
                         return; // VM console gone
                     }
                 }
@@ -347,8 +343,7 @@ fn spawn_console_resize_proxy(hvc_in: OwnedFd, socket_path: PathBuf) {
             let mut buf = [0u8; 64];
 
             loop {
-                let n =
-                    unsafe { libc::read(client_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+                let n = unsafe { libc::read(client_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
                 if n <= 0 {
                     break; // client disconnected, wait for next
                 }
@@ -533,7 +528,7 @@ Options
                         env::current_dir()?.join(subfolder),
                         false,
                     )
-                        .expect("Project directory must exist"),
+                    .expect("Project directory must exist"),
                 );
             }
         }
@@ -1354,11 +1349,12 @@ fn create_vm_configuration(
                 let console_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
                 console_port.setAttachment(Some(&console_attach));
 
-                let console_resize_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
-                    NSFileHandle::alloc(),
-                    console_resize_reads.into_raw_fd(),
-                    true,
-                );
+                let console_resize_read_handle =
+                    NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+                        NSFileHandle::alloc(),
+                        console_resize_reads.into_raw_fd(),
+                        true,
+                    );
                 let console_resize_attach =
                     VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
                         VZFileHandleSerialPortAttachment::alloc(),
@@ -1567,9 +1563,11 @@ fn run_vm(
 
     println!("VM booting...");
 
-    if let (Some(path), Some(out), Some(inp)) =
-        (console_socket_path.as_ref(), we_read_console, we_write_console)
-    {
+    if let (Some(path), Some(out), Some(inp)) = (
+        console_socket_path.as_ref(),
+        we_read_console,
+        we_write_console,
+    ) {
         spawn_console_socket_proxy(out, inp, path.clone());
     }
     if let (Some(path), Some(inp)) = (console_socket_path.as_ref(), we_write_console_resize) {
@@ -1633,17 +1631,11 @@ fn run_vm(
     }
 
     if console_socket_path.is_some() {
-        // agetty writes a utmp entry (needed for `who`) and sets up the terminal properly,
-        // including making hvc2 the controlling terminal of a new session.
-        // --local-line suppresses modem-control/baud-rate detection for a virtual device.
-        all_login_actions.push(Send(
-            " (while true; do agetty --autologin root --noclear --local-line hvc2 xterm-256color; done) &".to_string(),
-        ));
-        // Read resize events from hvc3 and apply them to hvc2 (mirrors hvc0/hvc1).
-        {
-            const S: &str = " sh -c '(while IFS=\" \" read -r rows cols; do stty -F /dev/hvc2 rows \"$rows\" cols \"$cols\"; done) < /dev/hvc3 >/dev/null 2>&1 &'";
-            all_login_actions.push(Send(S.to_string()));
-        }
+        all_login_actions.push(Send(" stty -F /dev/hvc2 sane".to_string()));
+        all_login_actions.push(Send(" (while true; do setsid bash -c 'exec bash --login < /dev/hvc2 > /dev/hvc2 2>&1'; done) &".to_string()));
+        const S: &str = " sh -c '(while IFS=\" \" read -r rows cols; do stty -F /dev/hvc2 rows \"$rows\" cols \"$cols\"; done) < /dev/hvc3 >/dev/null 2>&1 &'";
+        all_login_actions.push(Send(S.to_string()));
+        // }
     }
 
     for a in login_actions {
