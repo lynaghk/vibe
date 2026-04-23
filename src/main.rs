@@ -1635,7 +1635,6 @@ fn run_vm(
         all_login_actions.push(Send(" (while true; do setsid bash -c 'exec bash --login < /dev/hvc2 > /dev/hvc2 2>&1'; done) &".to_string()));
         const S: &str = " sh -c '(while IFS=\" \" read -r rows cols; do stty -F /dev/hvc2 rows \"$rows\" cols \"$cols\"; done) < /dev/hvc3 >/dev/null 2>&1 &'";
         all_login_actions.push(Send(S.to_string()));
-        // }
     }
 
     for a in login_actions {
