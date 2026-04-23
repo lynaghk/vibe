@@ -49,10 +49,21 @@ const PROVISION_SCRIPT: &str = include_str!("provision.sh");
 
 #[derive(Clone)]
 enum LoginAction {
-    Expect { text: String, timeout: Duration, },
-    CaptureTextToFile { start: String, end: String, to_file: PathBuf, timeout: Duration, },
+    Expect {
+        text: String,
+        timeout: Duration,
+    },
+    CaptureTextToFile {
+        start: String,
+        end: String,
+        to_file: PathBuf,
+        timeout: Duration,
+    },
     Send(String),
-    Script { path: PathBuf, index: usize, },
+    Script {
+        path: PathBuf,
+        index: usize,
+    },
 }
 use LoginAction::*;
 
@@ -162,9 +173,8 @@ fn ssh(instance_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let user_instance_ip = format!("root@{instance_ip}");
     args.push(&user_instance_ip);
 
-    let project_name = &env::current_dir()?
-        .file_name()
-        .ok_or("Project directory has no name")?
+    let abspath = env::current_dir()?
+        .into_os_string()
         .to_string_lossy()
         .into_owned();
     let ssh_args: Vec<String> = Vec::from_iter(
@@ -177,11 +187,11 @@ fn ssh(instance_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     args.push("-t");
     if ssh_args2.len() == 0 {
         // create a login shell in our subfolder
-        cd_shell.push_str(&format!(" cd {} && bash --login", project_name));
+        cd_shell.push_str(&format!(" cd {} && bash --login", abspath));
         args.push(&cd_shell);
     } else {
         // cd into our subfolder before executing given commands
-        cd_shell.push_str(&format!(" cd {} && ", project_name));
+        cd_shell.push_str(&format!(" cd {} && ", abspath));
         args.push(&cd_shell);
         args.append(&mut ssh_args2);
     }
@@ -268,11 +278,6 @@ Options
     ensure_signed();
 
     let project_root = env::current_dir()?;
-    let project_name = project_root
-        .file_name()
-        .ok_or("Project directory has no name")?
-        .to_string_lossy()
-        .into_owned();
 
     let home = env::var("HOME").map(PathBuf::from)?;
     let cache_home = env::var("XDG_CACHE_HOME")
@@ -352,7 +357,11 @@ Options
     )));
 
     if !args.no_default_mounts {
-        login_actions.push(Send(format!(" cd {project_name}")));
+        let abspath = env::current_dir()?
+            .into_os_string()
+            .to_string_lossy()
+            .into_owned();
+        login_actions.push(Send(format!(" cd {abspath}")));
 
         // Discourage read/write of project dir subfolders within the VM.
         // Note that this isn't secure, since the VM runs as root and could unmount this.
@@ -364,13 +373,25 @@ Options
         }
 
         directory_shares.push(
-            DirectoryShare::new(
-                project_root,
-                PathBuf::from("/root/").join(project_name),
-                false,
-            )
-            .expect("Project directory must exist"),
+            DirectoryShare::new(project_root, env::current_dir()?, false)
+                .expect("Project directory must exist"),
         );
+
+        for subfolder in [".venv", "node_modules"] {
+            if env::current_dir()?.join(subfolder).exists() {
+                println!(r"creating mapping {}", subfolder);
+                fs::create_dir_all(env::current_dir()?.join(".vibe").join(subfolder))
+                    .expect("Could not create .vibe subfolder");
+                directory_shares.push(
+                    DirectoryShare::new(
+                        env::current_dir()?.join(".vibe").join(subfolder),
+                        env::current_dir()?.join(subfolder),
+                        false,
+                    )
+                        .expect("Project directory must exist"),
+                );
+            }
+        }
 
         directory_shares.push(mise_directory_share);
 
