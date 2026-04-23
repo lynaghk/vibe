@@ -771,7 +771,7 @@ fn motd_login_action(directory_shares: &[DirectoryShare]) -> Option<LoginAction>
         ));
     }
 
-    let command = format!(" clear && cat <<'VIBE_MOTD'\n{output}\nVIBE_MOTD");
+    let command = format!(" cat <<'VIBE_MOTD'\n{output}\nVIBE_MOTD");
     Some(Send(command))
 }
 
@@ -1631,8 +1631,21 @@ fn run_vm(
     }
 
     if console_socket_path.is_some() {
-        all_login_actions.push(Send(" stty -F /dev/hvc2 sane".to_string()));
-        all_login_actions.push(Send(" (while true; do setsid bash -c 'exec bash --login < /dev/hvc2 > /dev/hvc2 2>&1'; done) &".to_string()));
+        // Use systemd to manage the hvc2 login session. systemd spawns the getty as a
+        // fresh PID-1 child with no inherited loginuid, so PAM's pam_loginuid.so works
+        // correctly and `who` shows the hvc2 entry. Running from hvc0 via a backgrounded
+        // shell would inherit hvc0's loginuid, preventing the utmp write.
+        // %%I in the printf format becomes %I in the file (systemd unit specifier).
+        all_login_actions.push(Send(
+            " mkdir -p /etc/systemd/system/serial-getty@hvc2.service.d".to_string(),
+        ));
+        all_login_actions.push(Send(
+            " printf '[Service]\\nExecStart=\\nExecStart=-/sbin/agetty --autologin root --noclear %%I xterm-256color\\n' > /etc/systemd/system/serial-getty@hvc2.service.d/autologin.conf".to_string(),
+        ));
+        all_login_actions.push(Send(
+            " systemctl daemon-reload && systemctl enable --now serial-getty@hvc2.service".to_string(),
+        ));
+        // Read resize events from hvc3 and apply them to hvc2 (mirrors hvc0/hvc1).
         const S: &str = " sh -c '(while IFS=\" \" read -r rows cols; do stty -F /dev/hvc2 rows \"$rows\" cols \"$cols\"; done) < /dev/hvc3 >/dev/null 2>&1 &'";
         all_login_actions.push(Send(S.to_string()));
     }
