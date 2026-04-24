@@ -46,6 +46,7 @@ const START_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_EXPECT_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_EXPECT_TIMEOUT: Duration = Duration::from_secs(120);
 const PROVISION_SCRIPT: &str = include_str!("provision.sh");
+const BASH_LOGOUT_SCRIPT: &str = include_str!("bash_logout.sh");
 
 #[derive(Clone)]
 enum LoginAction {
@@ -305,6 +306,13 @@ fn spawn_console_socket_proxy(hvc_out: OwnedFd, hvc_in: OwnedFd, socket_path: Pa
                         unsafe { libc::read(hvc_out_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
                     if n <= 0 {
                         return; // VM console gone
+                    }
+                    // Session-end sentinel written by the guest wrapper script after login
+                    // exits. Close the client socket so attach_console exits via normal
+                    // socket-close detection. OSC 9999 won't appear in real terminal output.
+                    const SENTINEL: &[u8] = b"\x1b]9999\x07";
+                    if buf[..n as usize].windows(SENTINEL.len()).any(|w| w == SENTINEL) {
+                        break 'client;
                     }
                     if unsafe { libc::write(client_fd, buf.as_ptr() as *const _, n as usize) } < 0 {
                         break 'client; // client disconnected
@@ -1659,6 +1667,7 @@ fn run_vm(
         // correctly and `who` shows the hvc2 entry. Running from hvc0 via a backgrounded
         // shell would inherit hvc0's loginuid, preventing the utmp write.
         // %%I in the printf format becomes %I in the file (systemd unit specifier).
+        all_login_actions.push(Send(script_command_from_content("bash_logout.sh", BASH_LOGOUT_SCRIPT)?));
         all_login_actions.push(Send(
             " mkdir -p /etc/systemd/system/serial-getty@hvc2.service.d".to_string(),
         ));

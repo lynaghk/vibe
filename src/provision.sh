@@ -14,8 +14,7 @@ apt-get install -y --no-install-recommends      \
         libssl-dev                              \
         curl                                    \
         git                                     \
-        ripgrep                                 \
-        openssh-server
+        ripgrep
 
 # Expand disk partition
 growpart /dev/vda 1
@@ -26,10 +25,7 @@ resize2fs /dev/vda1
 # Set hostname to vibe" so it's clear that you're inside the VM.
 hostnamectl set-hostname vibe
 
-# Allow root login for ssh
-sed -ri 's/^#?PermitRootLogin\s+.*/PermitRootLogin yes/' /etc/ssh/sshd_config
-
-# Don't display "Last login from ..." on ssh logins
+# Don't display "Last login from ..." on logins
 touch .hushlogin
 
 # Set this env var so claude doesn't complain about running as root.
@@ -52,6 +48,8 @@ echo "export HISTSIZE=" >> .bashrc
 cat > .bash_logout <<EOF
 history -w # Write bash history. Otherwise bash would be killed by poweroff without having written history
 
+echo "bash logout for tty: \$(tty) ..."
+
 # Turn off the VM when the last user logs out.
 if [[ "\$(tty)" == "/dev/hvc0" ]]; then
   # we are the primary terminal
@@ -62,7 +60,7 @@ if [[ "\$(tty)" == "/dev/hvc0" ]]; then
     sleep 100 # sleep here so that we don't see the login screen flash up before the shutdown.
   else
     echo ""
-    echo "VM not powering off as there are ssh sessions connected"
+    echo "VM not powering off as there are terminals connected"
   fi
 else
   # we are a ssh session
@@ -70,6 +68,9 @@ else
     # we are the last open terminal
     echo "VM powering off..."
     systemctl poweroff
+  else
+    echo "Detaching..."
+    printf '\033]9999\007' > /dev/hvc2
   fi
 fi
 EOF
