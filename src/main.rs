@@ -137,23 +137,58 @@ fn attach_console(
     instance_dir: PathBuf,
     login_actions: Vec<LoginAction>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let socket_path = instance_dir.join("console.sock");
+    // Try each console slot in order; use the first one that isn't already busy.
+    // The proxy sends "console is already attached\r\n" immediately when busy,
+    // so a 150 ms poll is enough to distinguish busy from available.
+    const BUSY_MSG: &[u8] = b"console is already attached\r\n";
+    const SOCK_NAMES: [&str; 3] = ["console.sock", "console1.sock", "console2.sock"];
 
-    if !socket_path.exists() {
-        return Err(format!(
-            "No VM console socket found at {}. Is the VM running?",
-            socket_path.display()
-        )
-        .into());
+    let mut chosen_stream: Option<UnixStream> = None;
+    let mut chosen_resize_path: Option<PathBuf> = None;
+    let mut prefetched: Vec<u8> = Vec::new();
+
+    for name in &SOCK_NAMES {
+        let path = instance_dir.join(name);
+        if !path.exists() {
+            continue;
+        }
+        let Ok(s) = UnixStream::connect(&path) else {
+            continue;
+        };
+        let fd = s.as_raw_fd();
+        let mut check_buf = [0u8; 64];
+        let mut poll_fd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let got_data = unsafe { libc::poll(&mut poll_fd, 1, 150) } > 0
+            && poll_fd.revents & libc::POLLIN != 0;
+        if got_data {
+            let n =
+                unsafe { libc::read(fd, check_buf.as_mut_ptr() as *mut _, check_buf.len()) };
+            if n > 0 && &check_buf[..n as usize] == BUSY_MSG {
+                continue; // busy — try next slot
+            }
+            if n > 0 {
+                prefetched.extend_from_slice(&check_buf[..n as usize]);
+            }
+        }
+        let resize_name = name.replace(".sock", "-resize.sock");
+        chosen_resize_path = Some(instance_dir.join(resize_name));
+        chosen_stream = Some(s);
+        break;
     }
 
-    let stream = UnixStream::connect(&socket_path)?;
+    let stream = chosen_stream.ok_or(
+        "All console slots are busy. Try again when a session exits.",
+    )?;
     let stream_fd = stream.as_raw_fd();
     let _stream = stream;
     let connect_time = Instant::now();
 
-    // Send terminal resize events to hvc3 (same protocol as hvc0/hvc1).
-    let resize_socket_path = instance_dir.join("console-resize.sock");
+    // Send terminal resize events over the matching resize socket.
+    let resize_socket_path = chosen_resize_path.unwrap_or_else(|| instance_dir.join("console-resize.sock"));
     if resize_socket_path.exists() {
         if let Ok(mut resize_stream) = UnixStream::connect(&resize_socket_path) {
             let _ = thread::spawn(move || {
@@ -188,7 +223,13 @@ fn attach_console(
     all_actions.extend(login_actions);
 
     let mut buf = [0u8; 4096];
-    let mut output_buf = String::new();
+    // Seed with any bytes already read during the busy-check poll.
+    let mut output_buf = String::from_utf8_lossy(&prefetched).into_owned();
+    if !prefetched.is_empty() {
+        let mut stdout = std::io::stdout().lock();
+        let _ = stdout.write_all(&prefetched);
+        let _ = stdout.flush();
+    }
 
     // Helper: poll both fds, forward stdin→socket, accumulate socket→stdout into output_buf.
     // Returns false if the socket closed.
@@ -1344,9 +1385,8 @@ fn create_vm_configuration(
     vm_reads_from_fd: OwnedFd,
     vm_writes_to_fd: OwnedFd,
     resize_reads_from_fd: OwnedFd,
-    console_reads_from_fd: Option<OwnedFd>,
-    console_writes_to_fd: Option<OwnedFd>,
-    console_resize_reads_from_fd: Option<OwnedFd>,
+    // Each entry adds one hvcN (bidirectional) + one hvcN+1 (resize read-only) serial port.
+    extra_consoles: Vec<(OwnedFd, OwnedFd, OwnedFd)>,
     cpu_count: usize,
     ram_bytes: u64,
 ) -> Result<Retained<VZVirtualMachineConfiguration>, Box<dyn std::error::Error>> {
@@ -1493,11 +1533,11 @@ fn create_vm_configuration(
             let resize_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
             resize_port.setAttachment(Some(&resize_attach));
 
-            if let (Some(console_reads), Some(console_writes), Some(console_resize_reads)) = (
-                console_reads_from_fd,
-                console_writes_to_fd,
-                console_resize_reads_from_fd,
-            ) {
+            let mut all_ports = vec![
+                Retained::into_super(serial_port),
+                Retained::into_super(resize_port),
+            ];
+            for (console_reads, console_writes, console_resize_reads) in extra_consoles {
                 let console_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
                     NSFileHandle::alloc(),
                     console_reads.into_raw_fd(),
@@ -1532,20 +1572,12 @@ fn create_vm_configuration(
                 let console_resize_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
                 console_resize_port.setAttachment(Some(&console_resize_attach));
 
-                let serial_ports: Retained<NSArray<_>> = NSArray::from_retained_slice(&[
-                    Retained::into_super(serial_port),
-                    Retained::into_super(resize_port),
-                    Retained::into_super(console_port),
-                    Retained::into_super(console_resize_port),
-                ]);
-                config.setSerialPorts(&serial_ports);
-            } else {
-                let serial_ports: Retained<NSArray<_>> = NSArray::from_retained_slice(&[
-                    Retained::into_super(serial_port),
-                    Retained::into_super(resize_port),
-                ]);
-                config.setSerialPorts(&serial_ports);
+                all_ports.push(Retained::into_super(console_port));
+                all_ports.push(Retained::into_super(console_resize_port));
             }
+            let serial_ports: Retained<NSArray<_>> =
+                NSArray::from_retained_slice(all_ports.as_slice());
+            config.setSerialPorts(&serial_ports);
         }
 
         ////////////////////////////
@@ -1647,28 +1679,26 @@ fn run_vm(
     let (vm_reads_from, we_write_to) = create_pipe();
     let (we_read_from, vm_writes_to) = create_pipe();
     let (resize_reads_from, we_write_resize_to) = create_pipe();
-    let (
-        console_reads_from,
-        console_writes_to,
-        we_read_console,
-        we_write_console,
-        console_resize_reads_from,
-        we_write_console_resize,
-    ) = if console_socket_path.is_some() {
-        let (reads_from, we_write) = create_pipe();
-        let (we_read, writes_to) = create_pipe();
-        let (resize_reads_from, we_write_resize) = create_pipe();
-        (
-            Some(reads_from),
-            Some(writes_to),
-            Some(we_read),
-            Some(we_write),
-            Some(resize_reads_from),
-            Some(we_write_resize),
-        )
-    } else {
-        (None, None, None, None, None, None)
-    };
+
+    // hvc2/hvc3, hvc4/hvc5, hvc6/hvc7 — one console+resize pair per attach slot.
+    const N_CONSOLE_SLOTS: usize = 3;
+    let (vm_extra_consoles, host_console_fds): (Vec<_>, Vec<_>) =
+        if console_socket_path.is_some() {
+            (0..N_CONSOLE_SLOTS)
+                .map(|_| {
+                    let (reads_from, we_write) = create_pipe();
+                    let (we_read, writes_to) = create_pipe();
+                    let (resize_reads_from, we_write_resize) = create_pipe();
+                    (
+                        (reads_from, writes_to, resize_reads_from),
+                        (we_read, we_write, we_write_resize),
+                    )
+                })
+                .unzip()
+        } else {
+            (vec![], vec![])
+        };
+
     let mut prepared_network_backend = prepare_network_backend();
     let config = create_vm_configuration(
         disk_path,
@@ -1677,9 +1707,7 @@ fn run_vm(
         vm_reads_from,
         vm_writes_to,
         resize_reads_from,
-        console_reads_from,
-        console_writes_to,
-        console_resize_reads_from,
+        vm_extra_consoles,
         cpu_count,
         ram_bytes,
     )?;
@@ -1731,16 +1759,24 @@ fn run_vm(
 
     println!("VM booting...");
 
-    if let (Some(path), Some(out), Some(inp)) = (
-        console_socket_path.as_ref(),
-        we_read_console,
-        we_write_console,
-    ) {
-        spawn_console_socket_proxy(out, inp, path.clone());
-    }
-    if let (Some(path), Some(inp)) = (console_socket_path.as_ref(), we_write_console_resize) {
-        let resize_path = path.with_file_name("console-resize.sock");
-        spawn_console_resize_proxy(inp, resize_path);
+    const CONSOLE_SOCK_NAMES: [&str; N_CONSOLE_SLOTS] =
+        ["console.sock", "console1.sock", "console2.sock"];
+    const RESIZE_SOCK_NAMES: [&str; N_CONSOLE_SLOTS] =
+        ["console-resize.sock", "console1-resize.sock", "console2-resize.sock"];
+    if let Some(ref base) = console_socket_path {
+        for (i, (host_read, host_write, host_resize_write)) in
+            host_console_fds.into_iter().enumerate()
+        {
+            spawn_console_socket_proxy(
+                host_read,
+                host_write,
+                base.with_file_name(CONSOLE_SOCK_NAMES[i]),
+            );
+            spawn_console_resize_proxy(
+                host_resize_write,
+                base.with_file_name(RESIZE_SOCK_NAMES[i]),
+            );
+        }
     }
 
     let output_monitor = Arc::new(OutputMonitor::default());
@@ -1800,24 +1836,35 @@ fn run_vm(
     }
 
     if console_socket_path.is_some() {
-        // Use systemd to manage the hvc2 login session. systemd spawns the getty as a
-        // fresh PID-1 child with no inherited loginuid, so PAM's pam_loginuid.so works
-        // correctly and `who` shows the hvc2 entry. Running from hvc0 via a backgrounded
-        // shell would inherit hvc0's loginuid, preventing the utmp write.
-        // %%I in the printf format becomes %I in the file (systemd unit specifier).
-        all_login_actions.push(Send(script_command_from_content("bash_logout.sh", BASH_LOGOUT_SCRIPT)?));
+        // systemd spawns each getty as a fresh PID-1 child with no inherited loginuid so
+        // PAM writes the utmp entry and `who` shows all sessions.
+        all_login_actions.push(Send(script_command_from_content(
+            "bash_logout.sh",
+            BASH_LOGOUT_SCRIPT,
+        )?));
+        // Configure and enable all N_CONSOLE_SLOTS getty services in one shot.
+        // %%I in the printf format becomes %I in the written file (systemd unit specifier).
         all_login_actions.push(Send(
-            " mkdir -p /etc/systemd/system/serial-getty@hvc2.service.d".to_string(),
+            " for d in hvc2 hvc4 hvc6; do \
+              mkdir -p /etc/systemd/system/serial-getty@${d}.service.d && \
+              printf '[Service]\\nExecStart=\\nExecStart=-/sbin/agetty --noclear %%I xterm-256color\\n' \
+                > /etc/systemd/system/serial-getty@${d}.service.d/autologin.conf; \
+              done"
+                .to_string(),
         ));
         all_login_actions.push(Send(
-            " printf '[Service]\\nExecStart=\\nExecStart=-/sbin/agetty --noclear %%I xterm-256color\\n' > /etc/systemd/system/serial-getty@hvc2.service.d/autologin.conf".to_string(),
+            " systemctl daemon-reload && systemctl enable --now \
+              serial-getty@hvc2.service serial-getty@hvc4.service serial-getty@hvc6.service"
+                .to_string(),
         ));
-        all_login_actions.push(Send(
-            " systemctl daemon-reload && systemctl enable --now serial-getty@hvc2.service".to_string(),
-        ));
-        // Read resize events from hvc3 and apply them to hvc2 (mirrors hvc0/hvc1).
-        const S: &str = " sh -c '(while IFS=\" \" read -r rows cols; do stty -F /dev/hvc2 rows \"$rows\" cols \"$cols\"; done) < /dev/hvc3 >/dev/null 2>&1 &'";
-        all_login_actions.push(Send(S.to_string()));
+        // Resize handlers: read resize events from hvcN+1 and apply them to hvcN.
+        for (console, resize) in [(2u8, 3u8), (4, 5), (6, 7)] {
+            all_login_actions.push(Send(format!(
+                " sh -c '(while IFS=\" \" read -r rows cols; \
+                  do stty -F /dev/hvc{console} rows \"$rows\" cols \"$cols\"; done) \
+                  < /dev/hvc{resize} >/dev/null 2>&1 &'"
+            )));
+        }
     }
 
     for a in login_actions {
@@ -1880,8 +1927,9 @@ fn run_vm(
     io_ctx.shutdown();
 
     if let Some(ref path) = console_socket_path {
-        let _ = fs::remove_file(path);
-        let _ = fs::remove_file(path.with_file_name("console-resize.sock"));
+        for name in CONSOLE_SOCK_NAMES.iter().chain(RESIZE_SOCK_NAMES.iter()) {
+            let _ = fs::remove_file(path.with_file_name(name));
+        }
     }
 
     exit_result
