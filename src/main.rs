@@ -1672,7 +1672,7 @@ fn run_vm(
             " mkdir -p /etc/systemd/system/serial-getty@hvc2.service.d".to_string(),
         ));
         all_login_actions.push(Send(
-            " printf '[Service]\\nExecStart=\\nExecStart=-/sbin/agetty --autologin root --noclear %%I xterm-256color\\n' > /etc/systemd/system/serial-getty@hvc2.service.d/autologin.conf".to_string(),
+            " printf '[Service]\\nExecStart=\\nExecStart=-/sbin/agetty --noclear %%I xterm-256color\\n' > /etc/systemd/system/serial-getty@hvc2.service.d/autologin.conf".to_string(),
         ));
         all_login_actions.push(Send(
             " systemctl daemon-reload && systemctl enable --now serial-getty@hvc2.service".to_string(),
