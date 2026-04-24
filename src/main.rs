@@ -252,7 +252,24 @@ fn spawn_console_socket_proxy(hvc_out: OwnedFd, hvc_in: OwnedFd, socket_path: Pa
             let _stream = stream;
             let mut buf = [0u8; 4096];
 
+            // Discard client→guest data for a brief window after connecting.
+            // When the client receives buffered output (agetty's terminal queries),
+            // the host terminal emulator responds automatically — those responses
+            // would appear as garbage on the guest command line. Ignoring client
+            // input for ~300 ms lets those automatic responses arrive and be dropped.
+            let ignore_client_input_until = Instant::now() + Duration::from_millis(300);
+
             'client: loop {
+                let now = Instant::now();
+                let poll_timeout_ms: i32 = if now < ignore_client_input_until {
+                    ignore_client_input_until
+                        .duration_since(now)
+                        .as_millis()
+                        .min(300) as i32
+                } else {
+                    -1
+                };
+
                 let mut fds = [
                     libc::pollfd {
                         fd: hvc_out_fd,
@@ -271,7 +288,7 @@ fn spawn_console_socket_proxy(hvc_out: OwnedFd, hvc_in: OwnedFd, socket_path: Pa
                     },
                 ];
 
-                let ret = unsafe { libc::poll(fds.as_mut_ptr(), 3, -1) };
+                let ret = unsafe { libc::poll(fds.as_mut_ptr(), 3, poll_timeout_ms) };
                 if ret < 0 {
                     break 'client;
                 }
@@ -299,7 +316,12 @@ fn spawn_console_socket_proxy(hvc_out: OwnedFd, hvc_in: OwnedFd, socket_path: Pa
                     if n <= 0 {
                         break 'client; // client disconnected
                     }
-                    if unsafe { libc::write(hvc_in_fd, buf.as_ptr() as *const _, n as usize) } < 0 {
+                    if Instant::now() < ignore_client_input_until {
+                        // Still in the ignore window — discard automatic terminal responses.
+                    } else if unsafe {
+                        libc::write(hvc_in_fd, buf.as_ptr() as *const _, n as usize)
+                    } < 0
+                    {
                         return; // VM console gone
                     }
                 }
@@ -1599,6 +1621,7 @@ fn run_vm(
         // Our terminal is connected via /dev/hvc0 which Debian apparently keeps barebones.
         // We want sane terminal defaults like icrnl (translating carriage returns into newlines)
         Send(" stty -F /dev/hvc0 sane".to_string()),
+        //  Send(" stty -F /dev/hvc2 sane".to_string()),
         // Grab the IP address of the VM and write it to .vibe/instance.ip
         Send(" echo \"VM IP\"\": $(hostname -I | cut -d ' ' -f1)\"".to_string()),
         CaptureTextToFile {
