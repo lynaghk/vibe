@@ -133,7 +133,10 @@ impl DirectoryShare {
     }
 }
 
-fn attach_console(instance_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn attach_console(
+    instance_dir: PathBuf,
+    login_actions: Vec<LoginAction>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let socket_path = instance_dir.join("console.sock");
 
     if !socket_path.exists() {
@@ -147,6 +150,7 @@ fn attach_console(instance_dir: PathBuf) -> Result<(), Box<dyn std::error::Error
     let stream = UnixStream::connect(&socket_path)?;
     let stream_fd = stream.as_raw_fd();
     let _stream = stream;
+    let connect_time = Instant::now();
 
     // Send terminal resize events to hvc3 (same protocol as hvc0/hvc1).
     let resize_socket_path = instance_dir.join("console-resize.sock");
@@ -169,7 +173,147 @@ fn attach_console(instance_dir: PathBuf) -> Result<(), Box<dyn std::error::Error
     let _raw = enable_raw_mode(libc::STDIN_FILENO)
         .map_err(|e| format!("Failed to enable raw mode: {e}"))?;
 
+    // Prepend auto-login then run any user-supplied actions before handing off interactively.
+    let mut all_actions: Vec<LoginAction> = vec![
+        Expect {
+            text: "login:".to_string(),
+            timeout: LOGIN_EXPECT_TIMEOUT,
+        },
+        Send("root".to_string()),
+        Expect {
+            text: "~#".to_string(),
+            timeout: LOGIN_EXPECT_TIMEOUT,
+        },
+    ];
+    all_actions.extend(login_actions);
+
     let mut buf = [0u8; 4096];
+    let mut output_buf = String::new();
+
+    // Helper: poll both fds, forward stdin→socket, accumulate socket→stdout into output_buf.
+    // Returns false if the socket closed.
+    macro_rules! poll_and_forward {
+        ($timeout_ms:expr) => {{
+            let mut fds = [
+                libc::pollfd {
+                    fd: libc::STDIN_FILENO,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: stream_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, $timeout_ms) };
+            if ret < 0 {
+                false
+            } else {
+                if fds[0].revents & libc::POLLIN != 0 {
+                    let n = unsafe {
+                        libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut _, buf.len())
+                    };
+                    if n > 0 {
+                        unsafe {
+                            libc::write(stream_fd, buf.as_ptr() as *const _, n as usize);
+                        }
+                    }
+                }
+                if fds[1].revents & libc::POLLIN != 0 {
+                    let n = unsafe {
+                        libc::read(stream_fd, buf.as_mut_ptr() as *mut _, buf.len())
+                    };
+                    if n <= 0 {
+                        return Ok(());
+                    }
+                    let data = &buf[..n as usize];
+                    let mut stdout = std::io::stdout().lock();
+                    let _ = stdout.write_all(data);
+                    let _ = stdout.flush();
+                    output_buf.push_str(&String::from_utf8_lossy(data));
+                }
+                true
+            }
+        }};
+    }
+
+    for action in all_actions {
+        match action {
+            Expect { text, timeout } => {
+                let deadline = Instant::now() + timeout;
+                loop {
+                    if let Some((_, rest)) = output_buf.split_once(text.as_str()) {
+                        output_buf = rest.to_string();
+                        break;
+                    }
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(format!("Timeout waiting for '{text}'").into());
+                    }
+                    let ms = (deadline - now).as_millis().min(100) as i32;
+                    if !poll_and_forward!(ms) {
+                        return Ok(());
+                    }
+                }
+            }
+            Send(text) => {
+                // Ensure the proxy's 350 ms post-connect discard window has passed before
+                // sending, so automatic terminal-emulator responses (from the initial burst
+                // of escape sequences) have already been discarded and our input isn't.
+                let elapsed = connect_time.elapsed();
+                let window = Duration::from_millis(350);
+                if elapsed < window {
+                    thread::sleep(window - elapsed);
+                }
+                let mut bytes = text.into_bytes();
+                bytes.push(b'\n');
+                unsafe { libc::write(stream_fd, bytes.as_ptr() as *const _, bytes.len()) };
+            }
+            Script { path, index } => {
+                let elapsed = connect_time.elapsed();
+                let window = Duration::from_millis(350);
+                if elapsed < window {
+                    thread::sleep(window - elapsed);
+                }
+                let command = script_command_from_path(&path, index)?;
+                let mut bytes = command.into_bytes();
+                bytes.push(b'\n');
+                unsafe { libc::write(stream_fd, bytes.as_ptr() as *const _, bytes.len()) };
+            }
+            CaptureTextToFile {
+                start,
+                end,
+                to_file,
+                timeout,
+            } => {
+                let deadline = Instant::now() + timeout;
+                loop {
+                    if let Some((_, after_start)) = output_buf.split_once(start.as_str()) {
+                        if let Some((captured, remaining)) =
+                            after_start.split_once(end.as_str())
+                        {
+                            fs::write(&to_file, captured)?;
+                            output_buf = remaining.to_string();
+                            break;
+                        }
+                    }
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(
+                            format!("Timeout waiting for capture '{start}' .. '{end}'").into(),
+                        );
+                    }
+                    let ms = (deadline - now).as_millis().min(100) as i32;
+                    if !poll_and_forward!(ms) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    // Interactive loop: bidirectional proxy until the socket closes or stdin EOF.
     loop {
         let mut fds = [
             libc::pollfd {
@@ -388,24 +532,6 @@ fn spawn_console_resize_proxy(hvc_in: OwnedFd, socket_path: PathBuf) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_signed();
 
-    let project_root = env::current_dir()?;
-    let instance_dir = project_root.join(".vibe");
-
-    if !instance_dir.exists() {
-        fs::create_dir_all(project_root.join(".vibe")).expect("Could not create .vibe folder");
-    }
-
-    // ssh into VM if an instance is already running
-    let instance_lock = instance_dir.join("instance.lock");
-    if !instance_lock.exists() {
-        fs::write(instance_lock, "").expect("Could not write lock file .vibe/instance.lock");
-    }
-    let lock_name = fs::canonicalize(instance_dir.join("instance.lock"))?;
-    let instance = SingleInstance::new(lock_name.to_str().unwrap())?;
-    if !instance.is_single() {
-        return attach_console(instance_dir);
-    }
-
     let args = parse_cli()?;
 
     if args.version {
@@ -413,7 +539,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("https://github.com/lynaghk/vibe/");
         println!("Git SHA: {}", env!("GIT_SHA"));
         println!("Built: {}", env!("BUILD_DATE"));
-
         std::process::exit(0);
     }
 
@@ -441,13 +566,28 @@ Options
   --send <some-command>                                     Type `some-command` followed by newline into the VM.
   --expect <string> [timeout-seconds]                       Wait for `string` to appear in console output before executing next `--script` or `--send`.
                                                             If `string` does not appear within timeout (default 30 seconds), shutdown VM with error.
-");
+"
+        );
         std::process::exit(0);
     }
 
-    ensure_signed();
-
     let project_root = env::current_dir()?;
+    let instance_dir = project_root.join(".vibe");
+
+    if !instance_dir.exists() {
+        fs::create_dir_all(project_root.join(".vibe")).expect("Could not create .vibe folder");
+    }
+
+    // Attach to VM via console if an instance is already running.
+    let instance_lock = instance_dir.join("instance.lock");
+    if !instance_lock.exists() {
+        fs::write(instance_lock, "").expect("Could not write lock file .vibe/instance.lock");
+    }
+    let lock_name = fs::canonicalize(instance_dir.join("instance.lock"))?;
+    let instance = SingleInstance::new(lock_name.to_str().unwrap())?;
+    if !instance.is_single() {
+        return attach_console(instance_dir, args.login_actions);
+    }
 
     let home = env::var("HOME").map(PathBuf::from)?;
     let cache_home = env::var("XDG_CACHE_HOME")
@@ -459,8 +599,6 @@ Options
     let prepare_network_backend = || args.network_mode.prepare(&vmnet_helper_path).unwrap();
 
     let guest_mise_cache = cache_dir.join(".guest-mise-cache");
-
-    let instance_dir = project_root.join(".vibe");
 
     let basename_compressed = DEBIAN_COMPRESSED_DISK_URL.rsplit('/').next().unwrap();
     let base_compressed = cache_dir.join(basename_compressed);

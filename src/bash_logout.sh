@@ -20,7 +20,10 @@ else
     # we are the last open terminal
     echo "VM powering off..."
     systemctl poweroff
-    sleep 100 # sleep here so that we don't see the login screen flash up before the shutdown.
+    # As part of the logout, write the OSC 9999 sentinel to the tty
+    # The proxy detects the sentinel and closes the client socket, which causes
+    # attach_console to exit via normal socket-close detection.
+    printf '\033]9999\007' > "\$(tty)"
   else
     echo "Detaching..."
     # As part of the logout, write the OSC 9999 sentinel to the tty
