@@ -6,8 +6,9 @@ use std::{
     os::{
         fd::RawFd,
         unix::{
+            fs::OpenOptionsExt,
             io::{AsRawFd, IntoRawFd, OwnedFd},
-            net::UnixStream,
+            net::{UnixListener, UnixStream},
             process::CommandExt,
         },
     },
@@ -27,6 +28,8 @@ use lexopt::prelude::*;
 use objc2::{AnyThread, rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::*;
 use objc2_virtualization::*;
+use single_instance::SingleInstance;
+use ssh_key::{Algorithm, PrivateKey, rand_core::OsRng};
 
 mod networking;
 use networking::*;
@@ -43,12 +46,25 @@ const START_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_EXPECT_TIMEOUT: Duration = Duration::from_secs(30);
 const LOGIN_EXPECT_TIMEOUT: Duration = Duration::from_secs(120);
 const PROVISION_SCRIPT: &str = include_str!("provision.sh");
+const BASH_LOGOUT_SCRIPT: &str = include_str!("bash_logout.sh");
 
 #[derive(Clone)]
 enum LoginAction {
-    Expect { text: String, timeout: Duration },
+    Expect {
+        text: String,
+        timeout: Duration,
+    },
+    CaptureTextToFile {
+        start: String,
+        end: String,
+        to_file: PathBuf,
+        timeout: Duration,
+    },
     Send(String),
-    Script { path: PathBuf, index: usize },
+    Script {
+        path: PathBuf,
+        index: usize,
+    },
 }
 use LoginAction::*;
 
@@ -117,7 +133,279 @@ impl DirectoryShare {
     }
 }
 
+fn attach_console(instance_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let socket_path = instance_dir.join("console.sock");
+
+    if !socket_path.exists() {
+        return Err(format!(
+            "No VM console socket found at {}. Is the VM running?",
+            socket_path.display()
+        )
+        .into());
+    }
+
+    let stream = UnixStream::connect(&socket_path)?;
+    let stream_fd = stream.as_raw_fd();
+    let _stream = stream;
+
+    // Send terminal resize events to hvc3 (same protocol as hvc0/hvc1).
+    let resize_socket_path = instance_dir.join("console-resize.sock");
+    if resize_socket_path.exists() {
+        if let Ok(mut resize_stream) = UnixStream::connect(&resize_socket_path) {
+            let _ = thread::spawn(move || {
+                loop {
+                    if let Some((rows, cols)) = terminal_size(libc::STDOUT_FILENO) {
+                        let msg = format!("{rows} {cols}\n");
+                        if resize_stream.write_all(msg.as_bytes()).is_err() {
+                            break;
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(200));
+                }
+            });
+        }
+    }
+
+    let _raw = enable_raw_mode(libc::STDIN_FILENO)
+        .map_err(|e| format!("Failed to enable raw mode: {e}"))?;
+
+    let mut buf = [0u8; 4096];
+    loop {
+        let mut fds = [
+            libc::pollfd {
+                fd: libc::STDIN_FILENO,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stream_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+
+        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        if ret < 0 {
+            break;
+        }
+
+        if fds[0].revents & libc::POLLIN != 0 {
+            let n =
+                unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            if unsafe { libc::write(stream_fd, buf.as_ptr() as *const _, n as usize) } < 0 {
+                break;
+            }
+        }
+
+        if fds[1].revents & libc::POLLIN != 0 {
+            let n = unsafe { libc::read(stream_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            let mut stdout = std::io::stdout().lock();
+            stdout.write_all(&buf[..n as usize])?;
+            stdout.flush()?;
+        }
+
+        if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            break;
+        }
+        if fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn spawn_console_socket_proxy(hvc_out: OwnedFd, hvc_in: OwnedFd, socket_path: PathBuf) {
+    let _ = thread::spawn(move || {
+        let _ = fs::remove_file(&socket_path);
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("[console] Failed to bind socket: {e}");
+                return;
+            }
+        };
+
+        let hvc_out_fd = hvc_out.as_raw_fd();
+        let hvc_in_fd = hvc_in.as_raw_fd();
+        let _hvc_out = hvc_out;
+        let _hvc_in = hvc_in;
+        let listener_fd = listener.as_raw_fd();
+
+        loop {
+            // Blocking accept: wait for the next client.
+            let (stream, _) = match listener.accept() {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+
+            // While serving this client, switch to non-blocking accept so new connections
+            // can be rejected immediately rather than queuing silently.
+            let _ = listener.set_nonblocking(true);
+
+            let client_fd = stream.as_raw_fd();
+            let _stream = stream;
+            let mut buf = [0u8; 4096];
+
+            // Discard client→guest data for a brief window after connecting.
+            // When the client receives buffered output (agetty's terminal queries),
+            // the host terminal emulator responds automatically — those responses
+            // would appear as garbage on the guest command line. Ignoring client
+            // input for ~300 ms lets those automatic responses arrive and be dropped.
+            let ignore_client_input_until = Instant::now() + Duration::from_millis(300);
+
+            'client: loop {
+                let now = Instant::now();
+                let poll_timeout_ms: i32 = if now < ignore_client_input_until {
+                    ignore_client_input_until
+                        .duration_since(now)
+                        .as_millis()
+                        .min(300) as i32
+                } else {
+                    -1
+                };
+
+                let mut fds = [
+                    libc::pollfd {
+                        fd: hvc_out_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: client_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: listener_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+
+                let ret = unsafe { libc::poll(fds.as_mut_ptr(), 3, poll_timeout_ms) };
+                if ret < 0 {
+                    break 'client;
+                }
+
+                // New connection while busy: drain the accept queue and reject each one.
+                if fds[2].revents & libc::POLLIN != 0 {
+                    while let Ok((mut new_stream, _)) = listener.accept() {
+                        let _ = new_stream.write_all(b"console is already attached\r\n");
+                    }
+                }
+
+                if fds[0].revents & libc::POLLIN != 0 {
+                    let n =
+                        unsafe { libc::read(hvc_out_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+                    if n <= 0 {
+                        return; // VM console gone
+                    }
+                    // Session-end sentinel written by the guest wrapper script after login
+                    // exits. Close the client socket so attach_console exits via normal
+                    // socket-close detection. OSC 9999 won't appear in real terminal output.
+                    const SENTINEL: &[u8] = b"\x1b]9999\x07";
+                    if buf[..n as usize].windows(SENTINEL.len()).any(|w| w == SENTINEL) {
+                        break 'client;
+                    }
+                    if unsafe { libc::write(client_fd, buf.as_ptr() as *const _, n as usize) } < 0 {
+                        break 'client; // client disconnected
+                    }
+                }
+
+                if fds[1].revents & libc::POLLIN != 0 {
+                    let n = unsafe { libc::read(client_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+                    if n <= 0 {
+                        break 'client; // client disconnected
+                    }
+                    if Instant::now() < ignore_client_input_until {
+                        // Still in the ignore window — discard automatic terminal responses.
+                    } else if unsafe {
+                        libc::write(hvc_in_fd, buf.as_ptr() as *const _, n as usize)
+                    } < 0
+                    {
+                        return; // VM console gone
+                    }
+                }
+
+                if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                    return;
+                }
+                if fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                    break 'client;
+                }
+            }
+
+            // Restore blocking mode so the next accept() at the top of the loop blocks.
+            let _ = listener.set_nonblocking(false);
+        }
+    });
+}
+
+fn spawn_console_resize_proxy(hvc_in: OwnedFd, socket_path: PathBuf) {
+    let _ = thread::spawn(move || {
+        let _ = fs::remove_file(&socket_path);
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("[console resize] Failed to bind socket: {e}");
+                return;
+            }
+        };
+
+        let hvc_in_fd = hvc_in.as_raw_fd();
+        let _hvc_in = hvc_in;
+
+        loop {
+            let (stream, _) = match listener.accept() {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+
+            let client_fd = stream.as_raw_fd();
+            let _stream = stream;
+            let mut buf = [0u8; 64];
+
+            loop {
+                let n = unsafe { libc::read(client_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+                if n <= 0 {
+                    break; // client disconnected, wait for next
+                }
+                if unsafe { libc::write(hvc_in_fd, buf.as_ptr() as *const _, n as usize) } < 0 {
+                    return; // VM gone
+                }
+            }
+        }
+    });
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ensure_signed();
+
+    let project_root = env::current_dir()?;
+    let instance_dir = project_root.join(".vibe");
+
+    if !instance_dir.exists() {
+        fs::create_dir_all(project_root.join(".vibe")).expect("Could not create .vibe folder");
+    }
+
+    // ssh into VM if an instance is already running
+    let instance_lock = instance_dir.join("instance.lock");
+    if !instance_lock.exists() {
+        fs::write(instance_lock, "").expect("Could not write lock file .vibe/instance.lock");
+    }
+    let lock_name = fs::canonicalize(instance_dir.join("instance.lock"))?;
+    let instance = SingleInstance::new(lock_name.to_str().unwrap())?;
+    if !instance.is_single() {
+        return attach_console(instance_dir);
+    }
+
     let args = parse_cli()?;
 
     if args.version {
@@ -160,11 +448,6 @@ Options
     ensure_signed();
 
     let project_root = env::current_dir()?;
-    let project_name = project_root
-        .file_name()
-        .ok_or("Project directory has no name")?
-        .to_string_lossy()
-        .into_owned();
 
     let home = env::var("HOME").map(PathBuf::from)?;
     let cache_home = env::var("XDG_CACHE_HOME")
@@ -217,8 +500,38 @@ Options
     let mut login_actions = Vec::new();
     let mut directory_shares = Vec::new();
 
+    // Generate ssh keypair. Save to host .vibe/id_ed25519 and .vibe/id_ed25519.pub
+    let private_key_path = instance_dir.join("id_ed25519");
+    let public_key_path = instance_dir.join("id_ed25519.pub");
+    if !private_key_path.exists() || !public_key_path.exists() {
+        let private_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?;
+        let public_key = private_key.public_key();
+        let privkey = private_key.to_openssh(base64ct::LineEnding::LF)?;
+        let pubkey_str = public_key.to_openssh()?.to_string();
+        fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .mode(0o600)
+            .open(private_key_path)
+            .expect("Could not create private ssh key .vibe/id_ed25519")
+            .write_all(privkey.as_bytes())
+            .expect("Could not write private ssh key .vibe/id_ed25519");
+        fs::write(public_key_path, pubkey_str)
+            .expect("Could not write public ssh key .vibe/id_ed25519.pub");
+    }
+
+    // Write public key to guest instance
+    let pubkey_str = fs::read_to_string(instance_dir.join("id_ed25519.pub"))?;
+    login_actions.push(Send(format!(
+        " echo '{pubkey_str}' > ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+    )));
+
     if !args.no_default_mounts {
-        login_actions.push(Send(format!(" cd {project_name}")));
+        let abspath = env::current_dir()?
+            .into_os_string()
+            .to_string_lossy()
+            .into_owned();
+        login_actions.push(Send(format!(" cd {abspath}")));
 
         // Discourage read/write of project dir subfolders within the VM.
         // Note that this isn't secure, since the VM runs as root and could unmount this.
@@ -230,13 +543,25 @@ Options
         }
 
         directory_shares.push(
-            DirectoryShare::new(
-                project_root,
-                PathBuf::from("/root/").join(project_name),
-                false,
-            )
-            .expect("Project directory must exist"),
+            DirectoryShare::new(project_root, env::current_dir()?, false)
+                .expect("Project directory must exist"),
         );
+
+        for subfolder in [".venv", "node_modules"] {
+            if env::current_dir()?.join(subfolder).exists() {
+                println!(r"creating mapping {}", subfolder);
+                fs::create_dir_all(env::current_dir()?.join(".vibe").join(subfolder))
+                    .expect("Could not create .vibe subfolder");
+                directory_shares.push(
+                    DirectoryShare::new(
+                        env::current_dir()?.join(".vibe").join(subfolder),
+                        env::current_dir()?.join(subfolder),
+                        false,
+                    )
+                    .expect("Project directory must exist"),
+                );
+            }
+        }
 
         directory_shares.push(mise_directory_share);
 
@@ -285,6 +610,7 @@ Options
         prepare_network_backend,
         args.cpu_count,
         args.ram_bytes,
+        Some(instance_dir.join("console.sock")),
     )
 }
 
@@ -475,7 +801,7 @@ fn motd_login_action(directory_shares: &[DirectoryShare]) -> Option<LoginAction>
         ));
     }
 
-    let command = format!(" clear && cat <<'VIBE_MOTD'\n{output}\nVIBE_MOTD");
+    let command = format!(" cat <<'VIBE_MOTD'\n{output}\nVIBE_MOTD");
     Some(Send(command))
 }
 
@@ -526,6 +852,32 @@ impl OutputMonitor {
             WaitResult::Timeout
         } else {
             WaitResult::Found
+        }
+    }
+
+    fn wait_for_start_end(&self, start: &str, end: &str, timeout: Duration) -> Option<String> {
+        let mut x = String::new();
+        let (_unused, timeout_result) = self
+            .condvar
+            .wait_timeout_while(self.buffer.lock().unwrap(), timeout, |buf| {
+                if let Some((_, remaining)) = buf.split_once(start) {
+                    if let Some((matched, remaining2)) = remaining.split_once(end) {
+                        x = matched.to_string();
+                        *buf = remaining2.to_string();
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                }
+            })
+            .unwrap();
+
+        if timeout_result.timed_out() {
+            None
+        } else {
+            Some(x)
         }
     }
 }
@@ -625,6 +977,7 @@ fn ensure_default_image(
         prepare_network_backend,
         DEFAULT_CPU_COUNT,
         DEFAULT_RAM_BYTES,
+        None,
     )?;
 
     Ok(())
@@ -853,6 +1206,9 @@ fn create_vm_configuration(
     vm_reads_from_fd: OwnedFd,
     vm_writes_to_fd: OwnedFd,
     resize_reads_from_fd: OwnedFd,
+    console_reads_from_fd: Option<OwnedFd>,
+    console_writes_to_fd: Option<OwnedFd>,
+    console_resize_reads_from_fd: Option<OwnedFd>,
     cpu_count: usize,
     ram_bytes: u64,
 ) -> Result<Retained<VZVirtualMachineConfiguration>, Box<dyn std::error::Error>> {
@@ -999,12 +1355,59 @@ fn create_vm_configuration(
             let resize_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
             resize_port.setAttachment(Some(&resize_attach));
 
-            let serial_ports: Retained<NSArray<_>> = NSArray::from_retained_slice(&[
-                Retained::into_super(serial_port),
-                Retained::into_super(resize_port),
-            ]);
+            if let (Some(console_reads), Some(console_writes), Some(console_resize_reads)) = (
+                console_reads_from_fd,
+                console_writes_to_fd,
+                console_resize_reads_from_fd,
+            ) {
+                let console_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+                    NSFileHandle::alloc(),
+                    console_reads.into_raw_fd(),
+                    true,
+                );
+                let console_write_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+                    NSFileHandle::alloc(),
+                    console_writes.into_raw_fd(),
+                    true,
+                );
+                let console_attach =
+                    VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                        VZFileHandleSerialPortAttachment::alloc(),
+                        Some(&console_read_handle),
+                        Some(&console_write_handle),
+                    );
+                let console_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
+                console_port.setAttachment(Some(&console_attach));
 
-            config.setSerialPorts(&serial_ports);
+                let console_resize_read_handle =
+                    NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+                        NSFileHandle::alloc(),
+                        console_resize_reads.into_raw_fd(),
+                        true,
+                    );
+                let console_resize_attach =
+                    VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                        VZFileHandleSerialPortAttachment::alloc(),
+                        Some(&console_resize_read_handle),
+                        None,
+                    );
+                let console_resize_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
+                console_resize_port.setAttachment(Some(&console_resize_attach));
+
+                let serial_ports: Retained<NSArray<_>> = NSArray::from_retained_slice(&[
+                    Retained::into_super(serial_port),
+                    Retained::into_super(resize_port),
+                    Retained::into_super(console_port),
+                    Retained::into_super(console_resize_port),
+                ]);
+                config.setSerialPorts(&serial_ports);
+            } else {
+                let serial_ports: Retained<NSArray<_>> = NSArray::from_retained_slice(&[
+                    Retained::into_super(serial_port),
+                    Retained::into_super(resize_port),
+                ]);
+                config.setSerialPorts(&serial_ports);
+            }
         }
 
         ////////////////////////////
@@ -1053,6 +1456,26 @@ fn spawn_login_actions_thread(
                         return;
                     }
                 }
+                CaptureTextToFile {
+                    start: begin,
+                    end,
+                    to_file,
+                    timeout,
+                } => {
+                    let res = output_monitor.wait_for_start_end(&begin, &end, timeout);
+                    match res {
+                        Some(p) => {
+                            fs::write(to_file, p).expect("Could not write to file");
+                        }
+                        None => {
+                            let _ = vm_output_tx.send(VmOutput::LoginActionTimeout {
+                                action: format!("expect '{}' ... '{}'", begin, end),
+                                timeout,
+                            });
+                            return;
+                        }
+                    }
+                }
                 Send(mut text) => {
                     text.push('\n'); // Type the newline so the command is actually submitted.
                     input_tx.send(VmInput::Bytes(text.into_bytes())).unwrap();
@@ -1081,10 +1504,33 @@ fn run_vm(
     prepare_network_backend: impl Fn() -> PreparedNetworkBackend,
     cpu_count: usize,
     ram_bytes: u64,
+    console_socket_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (vm_reads_from, we_write_to) = create_pipe();
     let (we_read_from, vm_writes_to) = create_pipe();
     let (resize_reads_from, we_write_resize_to) = create_pipe();
+    let (
+        console_reads_from,
+        console_writes_to,
+        we_read_console,
+        we_write_console,
+        console_resize_reads_from,
+        we_write_console_resize,
+    ) = if console_socket_path.is_some() {
+        let (reads_from, we_write) = create_pipe();
+        let (we_read, writes_to) = create_pipe();
+        let (resize_reads_from, we_write_resize) = create_pipe();
+        (
+            Some(reads_from),
+            Some(writes_to),
+            Some(we_read),
+            Some(we_write),
+            Some(resize_reads_from),
+            Some(we_write_resize),
+        )
+    } else {
+        (None, None, None, None, None, None)
+    };
     let mut prepared_network_backend = prepare_network_backend();
     let config = create_vm_configuration(
         disk_path,
@@ -1093,6 +1539,9 @@ fn run_vm(
         vm_reads_from,
         vm_writes_to,
         resize_reads_from,
+        console_reads_from,
+        console_writes_to,
+        console_resize_reads_from,
         cpu_count,
         ram_bytes,
     )?;
@@ -1144,6 +1593,18 @@ fn run_vm(
 
     println!("VM booting...");
 
+    if let (Some(path), Some(out), Some(inp)) = (
+        console_socket_path.as_ref(),
+        we_read_console,
+        we_write_console,
+    ) {
+        spawn_console_socket_proxy(out, inp, path.clone());
+    }
+    if let (Some(path), Some(inp)) = (console_socket_path.as_ref(), we_write_console_resize) {
+        let resize_path = path.with_file_name("console-resize.sock");
+        spawn_console_resize_proxy(inp, resize_path);
+    }
+
     let output_monitor = Arc::new(OutputMonitor::default());
     let io_ctx = spawn_vm_io(
         output_monitor.clone(),
@@ -1168,6 +1629,15 @@ fn run_vm(
         // Our terminal is connected via /dev/hvc0 which Debian apparently keeps barebones.
         // We want sane terminal defaults like icrnl (translating carriage returns into newlines)
         Send(" stty -F /dev/hvc0 sane".to_string()),
+        //  Send(" stty -F /dev/hvc2 sane".to_string()),
+        // Grab the IP address of the VM and write it to .vibe/instance.ip
+        Send(" echo \"VM IP\"\": $(hostname -I | cut -d ' ' -f1)\"".to_string()),
+        CaptureTextToFile {
+            start: "VM IP: ".to_string(),
+            end: "\r".to_string(), // apparantly \r is emitted for newline
+            to_file: env::current_dir()?.join(".vibe").join("instance.ip"),
+            timeout: DEFAULT_EXPECT_TIMEOUT,
+        },
         // In background, continuously read host terminal resizes sent over hvc1 and update hvc0.
         Send({
             // sorry for this nonsense, the string is so long it angers rustfmt =(
@@ -1189,6 +1659,27 @@ fn run_vm(
             all_login_actions.push(Send(format!(" mkdir -p {}", guest)));
             all_login_actions.push(Send(format!(" mount --bind {} {}", staging, guest)));
         }
+    }
+
+    if console_socket_path.is_some() {
+        // Use systemd to manage the hvc2 login session. systemd spawns the getty as a
+        // fresh PID-1 child with no inherited loginuid, so PAM's pam_loginuid.so works
+        // correctly and `who` shows the hvc2 entry. Running from hvc0 via a backgrounded
+        // shell would inherit hvc0's loginuid, preventing the utmp write.
+        // %%I in the printf format becomes %I in the file (systemd unit specifier).
+        all_login_actions.push(Send(script_command_from_content("bash_logout.sh", BASH_LOGOUT_SCRIPT)?));
+        all_login_actions.push(Send(
+            " mkdir -p /etc/systemd/system/serial-getty@hvc2.service.d".to_string(),
+        ));
+        all_login_actions.push(Send(
+            " printf '[Service]\\nExecStart=\\nExecStart=-/sbin/agetty --autologin root --noclear %%I xterm-256color\\n' > /etc/systemd/system/serial-getty@hvc2.service.d/autologin.conf".to_string(),
+        ));
+        all_login_actions.push(Send(
+            " systemctl daemon-reload && systemctl enable --now serial-getty@hvc2.service".to_string(),
+        ));
+        // Read resize events from hvc3 and apply them to hvc2 (mirrors hvc0/hvc1).
+        const S: &str = " sh -c '(while IFS=\" \" read -r rows cols; do stty -F /dev/hvc2 rows \"$rows\" cols \"$cols\"; done) < /dev/hvc3 >/dev/null 2>&1 &'";
+        all_login_actions.push(Send(S.to_string()));
     }
 
     for a in login_actions {
@@ -1249,6 +1740,11 @@ fn run_vm(
     let _ = login_actions_thread.join();
 
     io_ctx.shutdown();
+
+    if let Some(ref path) = console_socket_path {
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(path.with_file_name("console-resize.sock"));
+    }
 
     exit_result
 }
