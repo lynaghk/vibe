@@ -21,6 +21,5 @@ block2 = "*"
 dispatch2 = "*"
 libc = "*"
 lexopt = "0.3"
-single-instance = "0.3.3"
 ssh-key = { version = "0.6.7", features = ["ed25519", "getrandom"] }
 base64ct = "1.8.3"

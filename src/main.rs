@@ -1,12 +1,11 @@
 use std::{
     env,
-    ffi::OsString,
+    ffi::{CString, OsString},
     fs,
     io::{self, Write},
     os::{
         fd::RawFd,
         unix::{
-            fs::OpenOptionsExt,
             io::{AsRawFd, IntoRawFd, OwnedFd},
             net::{UnixListener, UnixStream},
             process::CommandExt,
@@ -28,8 +27,6 @@ use lexopt::prelude::*;
 use objc2::{AnyThread, rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::*;
 use objc2_virtualization::*;
-use single_instance::SingleInstance;
-use ssh_key::{Algorithm, PrivateKey, rand_core::OsRng};
 
 mod networking;
 use networking::*;
@@ -52,12 +49,6 @@ const BASH_LOGOUT_SCRIPT: &str = include_str!("bash_logout.sh");
 enum LoginAction {
     Expect {
         text: String,
-        timeout: Duration,
-    },
-    CaptureTextToFile {
-        start: String,
-        end: String,
-        to_file: PathBuf,
         timeout: Duration,
     },
     Send(String),
@@ -137,15 +128,19 @@ fn attach_console(
     instance_dir: PathBuf,
     login_actions: Vec<LoginAction>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("Attaching to console ...");
     // Try each console slot in order; use the first one that isn't already busy.
     // The proxy sends "console is already attached\r\n" immediately when busy,
     // so a 150 ms poll is enough to distinguish busy from available.
     const BUSY_MSG: &[u8] = b"console is already attached\r\n";
-    const SOCK_NAMES: [&str; 3] = ["console.sock", "console1.sock", "console2.sock"];
+    // hvc0.sock is the main daemon console (already logged in — no auto-login needed).
+    // The others are extra getty sessions (hvc2/4/6) that need auto-login.
+    const SOCK_NAMES: [&str; 4] = ["hvc0.sock", "console.sock", "console1.sock", "console2.sock"];
 
     let mut chosen_stream: Option<UnixStream> = None;
     let mut chosen_resize_path: Option<PathBuf> = None;
     let mut prefetched: Vec<u8> = Vec::new();
+    let mut chosen_name: &str = "";
 
     for name in &SOCK_NAMES {
         let path = instance_dir.join(name);
@@ -177,6 +172,7 @@ fn attach_console(
         let resize_name = name.replace(".sock", "-resize.sock");
         chosen_resize_path = Some(instance_dir.join(resize_name));
         chosen_stream = Some(s);
+        chosen_name = name;
         break;
     }
 
@@ -208,18 +204,35 @@ fn attach_console(
     let _raw = enable_raw_mode(libc::STDIN_FILENO)
         .map_err(|e| format!("Failed to enable raw mode: {e}"))?;
 
-    // Prepend auto-login then run any user-supplied actions before handing off interactively.
-    let mut all_actions: Vec<LoginAction> = vec![
-        Expect {
-            text: "login:".to_string(),
-            timeout: LOGIN_EXPECT_TIMEOUT,
-        },
-        Send("root".to_string()),
-        Expect {
-            text: "~#".to_string(),
-            timeout: LOGIN_EXPECT_TIMEOUT,
-        },
-    ];
+    // hvc0.sock is the daemon's main console — the VM is already logged in and the
+    // shell is running, so no auto-login sequence is needed.  The extra getty
+    // consoles (console.sock / console1.sock / console2.sock → hvc2/4/6) still
+    // need the auto-login dance because a fresh getty session greets with "login:".
+    let mut all_actions: Vec<LoginAction> = if chosen_name == "hvc0.sock" {
+        vec![
+            Expect {
+                text: "login:".to_string(),
+                timeout: LOGIN_EXPECT_TIMEOUT,
+            },
+            Send("root".to_string()),
+            Expect {
+                text: "~#".to_string(),
+                timeout: LOGIN_EXPECT_TIMEOUT,
+            },
+        ]
+    } else {
+        vec![
+            Expect {
+                text: "login:".to_string(),
+                timeout: LOGIN_EXPECT_TIMEOUT,
+            },
+            Send("root".to_string()),
+            Expect {
+                text: "~#".to_string(),
+                timeout: LOGIN_EXPECT_TIMEOUT,
+            },
+        ]
+    };
     all_actions.extend(login_actions);
 
     let mut buf = [0u8; 4096];
@@ -322,35 +335,6 @@ fn attach_console(
                 bytes.push(b'\n');
                 unsafe { libc::write(stream_fd, bytes.as_ptr() as *const _, bytes.len()) };
             }
-            CaptureTextToFile {
-                start,
-                end,
-                to_file,
-                timeout,
-            } => {
-                let deadline = Instant::now() + timeout;
-                loop {
-                    if let Some((_, after_start)) = output_buf.split_once(start.as_str()) {
-                        if let Some((captured, remaining)) =
-                            after_start.split_once(end.as_str())
-                        {
-                            fs::write(&to_file, captured)?;
-                            output_buf = remaining.to_string();
-                            break;
-                        }
-                    }
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return Err(
-                            format!("Timeout waiting for capture '{start}' .. '{end}'").into(),
-                        );
-                    }
-                    let ms = (deadline - now).as_millis().min(100) as i32;
-                    if !poll_and_forward!(ms) {
-                        return Ok(());
-                    }
-                }
-            }
         }
     }
 
@@ -407,16 +391,16 @@ fn attach_console(
 }
 
 fn spawn_console_socket_proxy(hvc_out: OwnedFd, hvc_in: OwnedFd, socket_path: PathBuf) {
+    // Bind synchronously so the socket file exists as soon as this function returns.
+    let _ = fs::remove_file(&socket_path);
+    let listener = match UnixListener::bind(&socket_path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[console] Failed to bind socket {}: {e}", socket_path.display());
+            return;
+        }
+    };
     let _ = thread::spawn(move || {
-        let _ = fs::remove_file(&socket_path);
-        let listener = match UnixListener::bind(&socket_path) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("[console] Failed to bind socket: {e}");
-                return;
-            }
-        };
-
         let hvc_out_fd = hvc_out.as_raw_fd();
         let hvc_in_fd = hvc_in.as_raw_fd();
         let _hvc_out = hvc_out;
@@ -534,16 +518,16 @@ fn spawn_console_socket_proxy(hvc_out: OwnedFd, hvc_in: OwnedFd, socket_path: Pa
 }
 
 fn spawn_console_resize_proxy(hvc_in: OwnedFd, socket_path: PathBuf) {
+    // Bind synchronously so the socket file exists as soon as this function returns.
+    let _ = fs::remove_file(&socket_path);
+    let listener = match UnixListener::bind(&socket_path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[console resize] Failed to bind socket {}: {e}", socket_path.display());
+            return;
+        }
+    };
     let _ = thread::spawn(move || {
-        let _ = fs::remove_file(&socket_path);
-        let listener = match UnixListener::bind(&socket_path) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("[console resize] Failed to bind socket: {e}");
-                return;
-            }
-        };
-
         let hvc_in_fd = hvc_in.as_raw_fd();
         let _hvc_in = hvc_in;
 
@@ -569,6 +553,209 @@ fn spawn_console_resize_proxy(hvc_in: OwnedFd, socket_path: PathBuf) {
         }
     });
 }
+
+/// Try to acquire an exclusive advisory lock on `instance_dir/instance.lock`.
+///
+/// The file is opened **without** `O_CLOEXEC` so that the daemon process
+/// inherits the file descriptor across the `exec` call.  As long as the
+/// daemon keeps the inherited FD open the lock is held, preventing a second
+/// `vibe` from starting another VM in the same directory.
+///
+/// Returns `Some(raw_fd)` if the lock was acquired, `None` if another process
+/// already holds it (VM is running).
+fn try_acquire_instance_lock(instance_dir: &Path) -> io::Result<Option<libc::c_int>> {
+    let lock_path = instance_dir.join("instance.lock");
+    // Create the file if it doesn't exist (ignoring errors — open below will fail if needed).
+    let _ = fs::OpenOptions::new().write(true).create(true).open(&lock_path);
+
+    let c_path = CString::new(lock_path.to_str().ok_or_else(|| {
+        io::Error::other("instance.lock path is not valid UTF-8")
+    })?)
+    .map_err(io::Error::other)?;
+
+    // Open without O_CLOEXEC so the FD survives exec in the daemon child.
+    let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_WRONLY, 0) };
+    if fd < 0 {
+        eprintln!("Could not open instance.lock");
+        return Err(io::Error::last_os_error());
+    }
+
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        eprintln!("client: Acquired instance.lock");
+        Ok(Some(fd)) // caller must keep fd open; do NOT wrap in OwnedFd
+    } else {
+        unsafe { libc::close(fd) };
+        eprintln!("client: Lock already held");
+        Ok(None)
+    }
+}
+
+fn run_daemon_vm(args: CliArgs, instance_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let home = env::var("HOME").map(PathBuf::from)?;
+    let cache_home = env::var("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home.join(".cache"));
+    let cache_dir = cache_home.join("vibe");
+    let project_root = env::current_dir()?;
+
+    let vmnet_helper_path = cache_dir.join("vmnet-helper");
+    let prepare_network_backend = || args.network_mode.prepare(&vmnet_helper_path).unwrap();
+
+    let mut login_actions = Vec::new();
+    let mut directory_shares = Vec::new();
+
+    if !args.no_default_mounts {
+        let abspath = env::current_dir()?
+            .into_os_string()
+            .to_string_lossy()
+            .into_owned();
+        login_actions.push(Send(format!(" cd {abspath}")));
+
+        // Discourage read/write of project dir subfolders within the VM.
+        // Note that this isn't secure, since the VM runs as root and could unmount this.
+        // I couldn't find an alternative way to do this --- the MacOS sandbox doesn't apply to the Apple Virtualization system =(
+        for subfolder in [".git", ".vibe"] {
+            if project_root.join(subfolder).exists() {
+                login_actions.push(Send(format!(r" mount -t tmpfs tmpfs {}", subfolder)))
+            }
+        }
+
+        directory_shares.push(
+            DirectoryShare::new(project_root, env::current_dir()?, false)
+                .expect("Project directory must exist"),
+        );
+
+        for subfolder in [".venv", "node_modules"] {
+            if env::current_dir()?.join(subfolder).exists() {
+                // println!(r"creating mapping {}", subfolder);
+                fs::create_dir_all(env::current_dir()?.join(".vibe").join(subfolder))
+                    .expect("Could not create .vibe/ subfolder");
+                directory_shares.push(
+                    DirectoryShare::new(
+                        env::current_dir()?.join(".vibe").join(subfolder),
+                        env::current_dir()?.join(subfolder),
+                        false,
+                    )
+                        .expect("Project directory must exist"),
+                );
+            }
+        }
+
+        let guest_mise_cache = cache_dir.join(".guest-mise-cache");
+        let mise_directory_share =
+            DirectoryShare::new(guest_mise_cache, "/root/.local/share/mise".into(), false)?;
+        directory_shares.push(mise_directory_share);
+
+        // Add default shares, if they exist
+        for share in [
+            DirectoryShare::new(home.join(".m2"), "/root/.m2".into(), false),
+            DirectoryShare::new(
+                home.join(".cargo/registry"),
+                "/root/.cargo/registry".into(),
+                false,
+            ),
+            DirectoryShare::new(home.join(".codex"), "/root/.codex".into(), false),
+            DirectoryShare::new(home.join(".claude"), "/root/.claude".into(), false),
+            DirectoryShare::new(home.join(".gemini"), "/root/.gemini".into(), false),
+        ]
+            .into_iter()
+            .flatten()
+        {
+            directory_shares.push(share)
+        }
+        // Bind-mount linux ripgrep over shared macos binary to ensure compatibility
+        login_actions.push(Send(
+            " if [ -f /root/.gemini/tmp/bin/rg ] && [ -f /usr/bin/rg ]; then mount --bind /usr/bin/rg /root/.gemini/tmp/bin/rg; fi"
+                .to_string()
+        ));
+    }
+
+    for spec in &args.mounts {
+        directory_shares.push(DirectoryShare::from_mount_spec(spec)?);
+    }
+
+    // Enable bash history
+    login_actions.push(Send(" export HISTFILE=/root/.bash_history".to_string()));
+
+    if let Some(motd_action) = motd_login_action(&directory_shares) {
+        login_actions.push(motd_action);
+    }
+
+    // Any user-provided login actions must come after our system ones
+    login_actions.extend(args.login_actions);
+
+    let instance_raw = instance_dir.join("instance.raw");
+
+    let disk_path = if let Some(path) = args.disk {
+        if !path.exists() {
+            return Err(format!("Disk image does not exist: {}", path.display()).into());
+        }
+        path
+    } else {
+        instance_raw
+    };
+
+
+    return run_vm(
+        &disk_path,
+        &login_actions,
+        &directory_shares[..],
+        prepare_network_backend,
+        args.cpu_count,
+        args.ram_bytes,
+        Some(instance_dir.join("console.sock")),
+    );
+}
+
+fn provision_vm(args: CliArgs, instance_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let home = env::var("HOME").map(PathBuf::from)?;
+    let cache_home = env::var("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home.join(".cache"));
+    let cache_dir = cache_home.join("vibe");
+
+    let vmnet_helper_path = cache_dir.join("vmnet-helper");
+    let prepare_network_backend = || args.network_mode.prepare(&vmnet_helper_path).unwrap();
+
+    let guest_mise_cache = cache_dir.join(".guest-mise-cache");
+
+    let basename_compressed = DEBIAN_COMPRESSED_DISK_URL.rsplit('/').next().unwrap();
+    let base_compressed = cache_dir.join(basename_compressed);
+    let base_raw = cache_dir.join(format!(
+        "{}.raw",
+        basename_compressed.trim_end_matches(".tar.xz")
+    ));
+
+    let default_raw = cache_dir.join("default.raw");
+    let instance_raw = instance_dir.join("instance.raw");
+
+    // Prepare system-wide directories
+    fs::create_dir_all(&cache_dir)?;
+    fs::create_dir_all(&guest_mise_cache)?;
+
+    let mise_directory_share =
+        DirectoryShare::new(guest_mise_cache, "/root/.local/share/mise".into(), false)?;
+
+    let _disk_path = if let Some(path) = args.disk {
+        if !path.exists() {
+            return Err(format!("Disk image does not exist: {}", path.display()).into());
+        }
+        path
+    } else {
+        ensure_default_image(
+            &base_raw,
+            &base_compressed,
+            &default_raw,
+            std::slice::from_ref(&mise_directory_share),
+            prepare_network_backend,
+        )?;
+        ensure_instance_disk(&instance_raw, &default_raw)?;
+
+        instance_raw
+    };
+    Ok(())
+}
+
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_signed();
@@ -619,184 +806,240 @@ Options
         fs::create_dir_all(project_root.join(".vibe")).expect("Could not create .vibe folder");
     }
 
-    // Attach to VM via console if an instance is already running.
-    let instance_lock = instance_dir.join("instance.lock");
-    if !instance_lock.exists() {
-        fs::write(instance_lock, "").expect("Could not write lock file .vibe/instance.lock");
-    }
-    let lock_name = fs::canonicalize(instance_dir.join("instance.lock"))?;
-    let instance = SingleInstance::new(lock_name.to_str().unwrap())?;
-    if !instance.is_single() {
-        return attach_console(instance_dir, args.login_actions);
-    }
-
-    let home = env::var("HOME").map(PathBuf::from)?;
-    let cache_home = env::var("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| home.join(".cache"));
-    let cache_dir = cache_home.join("vibe");
-
-    let vmnet_helper_path = cache_dir.join("vmnet-helper");
-    let prepare_network_backend = || args.network_mode.prepare(&vmnet_helper_path).unwrap();
-
-    let guest_mise_cache = cache_dir.join(".guest-mise-cache");
-
-    let basename_compressed = DEBIAN_COMPRESSED_DISK_URL.rsplit('/').next().unwrap();
-    let base_compressed = cache_dir.join(basename_compressed);
-    let base_raw = cache_dir.join(format!(
-        "{}.raw",
-        basename_compressed.trim_end_matches(".tar.xz")
-    ));
-
-    let default_raw = cache_dir.join("default.raw");
-    let instance_raw = instance_dir.join("instance.raw");
-
-    // Prepare system-wide directories
-    fs::create_dir_all(&cache_dir)?;
-    fs::create_dir_all(&guest_mise_cache)?;
-
-    let mise_directory_share =
-        DirectoryShare::new(guest_mise_cache, "/root/.local/share/mise".into(), false)?;
-
-    let disk_path = if let Some(path) = args.disk {
-        if !path.exists() {
-            return Err(format!("Disk image does not exist: {}", path.display()).into());
-        }
-        path
+    // If we're the daemon child we skip locking — the inherited FD already holds it.
+    // Otherwise, try to acquire the instance lock.  Failure means a VM is already
+    // running in this directory; just attach to its console.
+    let _lock_fd: Option<libc::c_int> = if args.daemon {
+        None
     } else {
-        ensure_default_image(
-            &base_raw,
-            &base_compressed,
-            &default_raw,
-            std::slice::from_ref(&mise_directory_share),
-            prepare_network_backend,
-        )?;
-        ensure_instance_disk(&instance_raw, &default_raw)?;
-
-        instance_raw
+        match try_acquire_instance_lock(&instance_dir)
+            .map_err(|e| format!("Could not open instance lock: {e}"))?
+        {
+            None => return attach_console(instance_dir, args.login_actions),
+            Some(fd) => Some(fd),
+            // fd is intentionally leaked here: it must stay open so the daemon
+            // inherits it across exec and continues to hold the lock.
+        }
     };
 
-    let mut login_actions = Vec::new();
-    let mut directory_shares = Vec::new();
+    if !args.daemon {
+        // We are the initial client.
+        // Sanity check that no VM is running:
+        let hvc0_sock = instance_dir.join("hvc0.sock");
+        if hvc0_sock.exists() {
+            return Err("hvc0.sock exists".into());
+        }
 
-    // Generate ssh keypair. Save to host .vibe/id_ed25519 and .vibe/id_ed25519.pub
-    let private_key_path = instance_dir.join("id_ed25519");
-    let public_key_path = instance_dir.join("id_ed25519.pub");
-    if !private_key_path.exists() || !public_key_path.exists() {
-        let private_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)?;
-        let public_key = private_key.public_key();
-        let privkey = private_key.to_openssh(base64ct::LineEnding::LF)?;
-        let pubkey_str = public_key.to_openssh()?.to_string();
-        fs::OpenOptions::new()
-            .create(true)
+        // Provision the VM if needed.
+        provision_vm(args, project_root.join(".vibe"))?;
+
+        // Spawn the daemon by re-execing this binary with --_daemon prepended to
+        // the original arguments.  Using Command::spawn (fork+exec) rather than a
+        // bare fork() is required on macOS: a raw fork leaves the child with a
+        // corrupted ObjC/GCD runtime, causing the Virtualization framework to fail
+        // with "Internal Virtualization error".  After exec the child starts fresh.
+        //
+        // The instance-lock file descriptor was opened without O_CLOEXEC, so the
+        // daemon inherits it across the exec call and holds the lock for its entire
+        // lifetime — preventing a second `vibe` from starting a second VM.
+        let log_file = fs::OpenOptions::new()
             .write(true)
-            .mode(0o600)
-            .open(private_key_path)
-            .expect("Could not create private ssh key .vibe/id_ed25519")
-            .write_all(privkey.as_bytes())
-            .expect("Could not write private ssh key .vibe/id_ed25519");
-        fs::write(public_key_path, pubkey_str)
-            .expect("Could not write public ssh key .vibe/id_ed25519.pub");
+            .create(true)
+            .truncate(true)
+            .open(instance_dir.join("daemon.log"))?;
+        eprintln!("Spawning VM daemon...");
+        Command::new(env::current_exe()?)
+            .arg("--_daemon")
+            .args(env::args_os().skip(1))
+            .stdin(Stdio::null())
+            .stdout(log_file.try_clone()?)
+            .stderr(log_file)
+            .spawn()?;
+
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let mut last_dot = Instant::now();
+        eprintln!("Waiting for VM");
+        while !hvc0_sock.exists() {
+            if Instant::now() >= deadline {
+                return Err("client: Timed out waiting for VM daemon to finish booting".into());
+            }
+            if last_dot.elapsed() >= Duration::from_secs(5) {
+                eprint!(".");
+                last_dot = Instant::now();
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+        attach_console(instance_dir, parse_cli()?.login_actions)
+    } else {
+        // At this point the VM is provisioned. The VM is now powered off.
+        // We are the daemon process: run the VM and keep it alive.
+        // The instance lock is already held via the inherited file descriptor.
+        run_daemon_vm(args, instance_dir)
     }
 
-    // Write public key to guest instance
-    let pubkey_str = fs::read_to_string(instance_dir.join("id_ed25519.pub"))?;
-    login_actions.push(Send(format!(
-        " echo '{pubkey_str}' > ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
-    )));
 
-    if !args.no_default_mounts {
-        let abspath = env::current_dir()?
-            .into_os_string()
-            .to_string_lossy()
-            .into_owned();
-        login_actions.push(Send(format!(" cd {abspath}")));
+    // At this point the VM is provisioned. The VM is now powered off.
+    // if args.daemon {
+    //     We are the daemon process: run the VM and keep it alive.
+        // The instance lock is already held via the inherited file descriptor.
+        // return run_daemon_vm(args, &disk_path, prepare_network_backend, )
+        // return run_vm(
+        //     &disk_path,
+        //     prepare_network_backend,
+        //     args.cpu_count,
+        //     args.ram_bytes,
+        //     Some(instance_dir.join("console.sock")),
+        // );
+    // } else {
+    //
+    // }
+    // let mut login_actions = Vec::new();
+    // let mut directory_shares = Vec::new();
+
+    // if !args.no_default_mounts {
+    //     let abspath = env::current_dir()?
+    //         .into_os_string()
+    //         .to_string_lossy()
+    //         .into_owned();
+    //     login_actions.push(Send(format!(" cd {abspath}")));
 
         // Discourage read/write of project dir subfolders within the VM.
         // Note that this isn't secure, since the VM runs as root and could unmount this.
         // I couldn't find an alternative way to do this --- the MacOS sandbox doesn't apply to the Apple Virtualization system =(
-        for subfolder in [".git", ".vibe"] {
-            if project_root.join(subfolder).exists() {
-                login_actions.push(Send(format!(r" mount -t tmpfs tmpfs {}", subfolder)))
-            }
-        }
+        // for subfolder in [".git", ".vibe"] {
+        //     if project_root.join(subfolder).exists() {
+        //         login_actions.push(Send(format!(r" mount -t tmpfs tmpfs {}", subfolder)))
+        //     }
+        // }
 
-        directory_shares.push(
-            DirectoryShare::new(project_root, env::current_dir()?, false)
-                .expect("Project directory must exist"),
-        );
+        // directory_shares.push(
+        //     DirectoryShare::new(project_root, env::current_dir()?, false)
+        //         .expect("Project directory must exist"),
+        // );
 
-        for subfolder in [".venv", "node_modules"] {
-            if env::current_dir()?.join(subfolder).exists() {
-                println!(r"creating mapping {}", subfolder);
-                fs::create_dir_all(env::current_dir()?.join(".vibe").join(subfolder))
-                    .expect("Could not create .vibe subfolder");
-                directory_shares.push(
-                    DirectoryShare::new(
-                        env::current_dir()?.join(".vibe").join(subfolder),
-                        env::current_dir()?.join(subfolder),
-                        false,
-                    )
-                    .expect("Project directory must exist"),
-                );
-            }
-        }
+        // for subfolder in [".venv", "node_modules"] {
+        //     if env::current_dir()?.join(subfolder).exists() {
+                // println!(r"creating mapping {}", subfolder);
+                // fs::create_dir_all(env::current_dir()?.join(".vibe").join(subfolder))
+                //     .expect("Could not create .vibe/ subfolder");
+                // directory_shares.push(
+                //     DirectoryShare::new(
+                //         env::current_dir()?.join(".vibe").join(subfolder),
+                //         env::current_dir()?.join(subfolder),
+                //         false,
+                //     )
+                //     .expect("Project directory must exist"),
+                // );
+            // }
+        // }
 
-        directory_shares.push(mise_directory_share);
+        // directory_shares.push(mise_directory_share);
 
         // Add default shares, if they exist
-        for share in [
-            DirectoryShare::new(home.join(".m2"), "/root/.m2".into(), false),
-            DirectoryShare::new(
-                home.join(".cargo/registry"),
-                "/root/.cargo/registry".into(),
-                false,
-            ),
-            DirectoryShare::new(home.join(".codex"), "/root/.codex".into(), false),
-            DirectoryShare::new(home.join(".claude"), "/root/.claude".into(), false),
-            DirectoryShare::new(home.join(".gemini"), "/root/.gemini".into(), false),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            directory_shares.push(share)
-        }
+        // for share in [
+        //     DirectoryShare::new(home.join(".m2"), "/root/.m2".into(), false),
+        //     DirectoryShare::new(
+        //         home.join(".cargo/registry"),
+        //         "/root/.cargo/registry".into(),
+        //         false,
+        //     ),
+        //     DirectoryShare::new(home.join(".codex"), "/root/.codex".into(), false),
+        //     DirectoryShare::new(home.join(".claude"), "/root/.claude".into(), false),
+        //     DirectoryShare::new(home.join(".gemini"), "/root/.gemini".into(), false),
+        // ]
+        // .into_iter()
+        // .flatten()
+        // {
+        //     directory_shares.push(share)
+        // }
         // Bind-mount linux ripgrep over shared macos binary to ensure compatibility
-        login_actions.push(Send(
-            " if [ -f /root/.gemini/tmp/bin/rg ] && [ -f /usr/bin/rg ]; then mount --bind /usr/bin/rg /root/.gemini/tmp/bin/rg; fi"
-                .to_string()
-        ));
-    }
+        // login_actions.push(Send(
+        //     " if [ -f /root/.gemini/tmp/bin/rg ] && [ -f /usr/bin/rg ]; then mount --bind /usr/bin/rg /root/.gemini/tmp/bin/rg; fi"
+        //         .to_string()
+        // ));
+    // }
 
-    for spec in &args.mounts {
-        directory_shares.push(DirectoryShare::from_mount_spec(spec)?);
-    }
+    // for spec in &args.mounts {
+    //     directory_shares.push(DirectoryShare::from_mount_spec(spec)?);
+    // }
 
     // Enable bash history
-    login_actions.push(Send(" export HISTFILE=/root/.bash_history".to_string()));
+    // login_actions.push(Send(" export HISTFILE=/root/.bash_history".to_string()));
 
-    if let Some(motd_action) = motd_login_action(&directory_shares) {
-        login_actions.push(motd_action);
-    }
+    // if let Some(motd_action) = motd_login_action(&directory_shares) {
+    //     login_actions.push(motd_action);
+    // }
 
     // Any user-provided login actions must come after our system ones
-    login_actions.extend(args.login_actions);
+    // login_actions.extend(args.login_actions);
 
-    run_vm(
-        &disk_path,
-        &login_actions,
-        &directory_shares[..],
-        prepare_network_backend,
-        args.cpu_count,
-        args.ram_bytes,
-        Some(instance_dir.join("console.sock")),
-    )
+    // if args.daemon {
+    //     We are the daemon process: run the VM and keep it alive.
+    //     The instance lock is already held via the inherited file descriptor.
+        // return run_vm(
+        //     &disk_path,
+        //     &login_actions,
+        //     &directory_shares[..],
+        //     prepare_network_backend,
+        //     args.cpu_count,
+        //     args.ram_bytes,
+        //     Some(instance_dir.join("console.sock")),
+        // );
+    // }
+
+    // Spawn the daemon by re-execing this binary with --_daemon prepended to
+    // the original arguments.  Using Command::spawn (fork+exec) rather than a
+    // bare fork() is required on macOS: a raw fork leaves the child with a
+    // corrupted ObjC/GCD runtime, causing the Virtualization framework to fail
+    // with "Internal Virtualization error".  After exec the child starts fresh.
+    //
+    // The instance-lock file descriptor was opened without O_CLOEXEC, so the
+    // daemon inherits it across the exec call and holds the lock for its entire
+    // lifetime — preventing a second `vibe` from starting a second VM.
+    // let log_file = fs::OpenOptions::new()
+    //     .write(true)
+    //     .create(true)
+    //     .truncate(true)
+    //     .open(instance_dir.join("daemon.log"))?;
+    // eprintln!("client: Spawning VM daemon...");
+    // Command::new(env::current_exe()?)
+    //     .arg("--_daemon")
+    //     .args(env::args_os().skip(1))
+    //     .stdin(Stdio::null())
+    //     .stdout(log_file.try_clone()?)
+    //     .stderr(log_file)
+    //     .spawn()?;
+
+    // let hvc0_sock = instance_dir.join("hvc0.sock");
+    // let deadline = Instant::now() + Duration::from_secs(300);
+    // let mut last_dot = Instant::now();
+    // eprintln!("client: Waiting to attach.");
+    // let mut dots = 0;
+    // while !hvc0_sock.exists() {
+    //     if Instant::now() >= deadline {
+    //         return Err("client: Timed out waiting for VM daemon to finish booting".into());
+    //     }
+    //     if last_dot.elapsed() >= Duration::from_secs(5) {
+    //         dots += 1;
+    //         eprint!("client: Waiting to attach.");
+    //         let mut dots2 = dots;
+    //         while dots2 > 0 {
+    //             dots2 -= 1;
+    //             eprint!(".");
+    //         }
+    //         eprintln!();
+    //         last_dot = Instant::now();
+    //     }
+    //     thread::sleep(Duration::from_millis(200));
+    // }
+    // attach_console(instance_dir, login_actions)
 }
 
 struct CliArgs {
     disk: Option<PathBuf>,
     version: bool,
     help: bool,
+    daemon: bool,
     no_default_mounts: bool,
     mounts: Vec<String>,
     login_actions: Vec<LoginAction>,
@@ -816,6 +1059,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
     let mut disk = None;
     let mut version = false;
     let mut help = false;
+    let mut daemon = false;
     let mut no_default_mounts = false;
     let mut mounts = Vec::new();
     let mut login_actions = Vec::new();
@@ -828,6 +1072,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         match arg {
             Long("version") => version = true,
             Long("help") | Short('h') => help = true,
+            Long("_daemon") => daemon = true,
             Long("no-default-mounts") => no_default_mounts = true,
             Long("cpus") => {
                 let value = os_to_string(parser.value()?, "--cpus")?.parse()?;
@@ -882,6 +1127,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         disk,
         version,
         help,
+        daemon,
         no_default_mounts,
         mounts,
         login_actions,
@@ -1034,31 +1280,6 @@ impl OutputMonitor {
         }
     }
 
-    fn wait_for_start_end(&self, start: &str, end: &str, timeout: Duration) -> Option<String> {
-        let mut x = String::new();
-        let (_unused, timeout_result) = self
-            .condvar
-            .wait_timeout_while(self.buffer.lock().unwrap(), timeout, |buf| {
-                if let Some((_, remaining)) = buf.split_once(start) {
-                    if let Some((matched, remaining2)) = remaining.split_once(end) {
-                        x = matched.to_string();
-                        *buf = remaining2.to_string();
-                        false
-                    } else {
-                        true
-                    }
-                } else {
-                    true
-                }
-            })
-            .unwrap();
-
-        if timeout_result.timed_out() {
-            None
-        } else {
-            Some(x)
-        }
-    }
 }
 
 fn ensure_base_image(
@@ -1626,26 +1847,6 @@ fn spawn_login_actions_thread(
                         return;
                     }
                 }
-                CaptureTextToFile {
-                    start: begin,
-                    end,
-                    to_file,
-                    timeout,
-                } => {
-                    let res = output_monitor.wait_for_start_end(&begin, &end, timeout);
-                    match res {
-                        Some(p) => {
-                            fs::write(to_file, p).expect("Could not write to file");
-                        }
-                        None => {
-                            let _ = vm_output_tx.send(VmOutput::LoginActionTimeout {
-                                action: format!("expect '{}' ... '{}'", begin, end),
-                                timeout,
-                            });
-                            return;
-                        }
-                    }
-                }
                 Send(mut text) => {
                     text.push('\n'); // Type the newline so the command is actually submitted.
                     input_tx.send(VmInput::Bytes(text.into_bytes())).unwrap();
@@ -1767,6 +1968,7 @@ fn run_vm(
         for (i, (host_read, host_write, host_resize_write)) in
             host_console_fds.into_iter().enumerate()
         {
+            eprintln!("spawning proxy {}", i);
             spawn_console_socket_proxy(
                 host_read,
                 host_write,
@@ -1778,14 +1980,6 @@ fn run_vm(
             );
         }
     }
-
-    let output_monitor = Arc::new(OutputMonitor::default());
-    let io_ctx = spawn_vm_io(
-        output_monitor.clone(),
-        we_read_from,
-        we_write_to,
-        we_write_resize_to,
-    );
 
     let mut all_login_actions = vec![
         Expect {
@@ -1803,15 +1997,6 @@ fn run_vm(
         // Our terminal is connected via /dev/hvc0 which Debian apparently keeps barebones.
         // We want sane terminal defaults like icrnl (translating carriage returns into newlines)
         Send(" stty -F /dev/hvc0 sane".to_string()),
-        //  Send(" stty -F /dev/hvc2 sane".to_string()),
-        // Grab the IP address of the VM and write it to .vibe/instance.ip
-        Send(" echo \"VM IP\"\": $(hostname -I | cut -d ' ' -f1)\"".to_string()),
-        CaptureTextToFile {
-            start: "VM IP: ".to_string(),
-            end: "\r".to_string(), // apparantly \r is emitted for newline
-            to_file: env::current_dir()?.join(".vibe").join("instance.ip"),
-            timeout: DEFAULT_EXPECT_TIMEOUT,
-        },
         // In background, continuously read host terminal resizes sent over hvc1 and update hvc0.
         Send({
             // sorry for this nonsense, the string is so long it angers rustfmt =(
@@ -1836,16 +2021,21 @@ fn run_vm(
     }
 
     if console_socket_path.is_some() {
-        // systemd spawns each getty as a fresh PID-1 child with no inherited loginuid so
-        // PAM writes the utmp entry and `who` shows all sessions.
         all_login_actions.push(Send(script_command_from_content(
             "bash_logout.sh",
             BASH_LOGOUT_SCRIPT,
         )?));
-        // Configure and enable all N_CONSOLE_SLOTS getty services in one shot.
+        // Configure autologin for hvc0 so reconnects after the user types `exit` are seamless.
         // %%I in the printf format becomes %I in the written file (systemd unit specifier).
+        // all_login_actions.push(Send(
+        //     " mkdir -p /etc/systemd/system/serial-getty@hvc0.service.d && \
+        //       printf '[Service]\\nExecStart=\\nExecStart=-/sbin/agetty --noclear --autologin root %%I xterm-256color\\n' \
+        //         > /etc/systemd/system/serial-getty@hvc0.service.d/autologin.conf"
+        //         .to_string(),
+        // ));
+        // Configure and enable all N_CONSOLE_SLOTS getty services in one shot.
         all_login_actions.push(Send(
-            " for d in hvc2 hvc4 hvc6; do \
+            " for d in hvc0 hvc2 hvc4 hvc6; do \
               mkdir -p /etc/systemd/system/serial-getty@${d}.service.d && \
               printf '[Service]\\nExecStart=\\nExecStart=-/sbin/agetty --noclear %%I xterm-256color\\n' \
                 > /etc/systemd/system/serial-getty@${d}.service.d/autologin.conf; \
@@ -1871,68 +2061,204 @@ fn run_vm(
         all_login_actions.push(a.clone())
     }
 
-    let (vm_output_tx, vm_output_rx) = mpsc::channel::<VmOutput>();
-    let login_actions_thread = spawn_login_actions_thread(
-        all_login_actions,
-        output_monitor.clone(),
-        io_ctx.input_tx.clone(),
-        vm_output_tx,
-    );
+    if let Some(ref console_path) = console_socket_path {
+        eprintln!("daemon mode ...");
+        // ── Daemon mode ────────────────────────────────────────────────────────
+        // Drive login actions internally (no stdin/stdout) via a pair of threads
+        // that read/write the hvc0 pipe directly.  After login completes a
+        // supervisor thread hands the pipe FDs over to a socket proxy so that
+        // `attach_console` can connect just like it does for hvc2/4/6.
 
-    let mut last_state = None;
-    let mut exit_result = Ok(());
-    loop {
-        unsafe {
-            NSRunLoop::mainRunLoop().runMode_beforeDate(
-                NSDefaultRunLoopMode,
-                &NSDate::dateWithTimeIntervalSinceNow(0.2),
-            )
-        };
+        let output_monitor = Arc::new(OutputMonitor::default());
 
-        let state = unsafe { vm.state() };
-        if last_state != Some(state) {
-            //eprintln!("[state] {:?}", state);
-            last_state = Some(state);
-        }
-        match vm_output_rx.try_recv() {
-            Ok(VmOutput::LoginActionTimeout { action, timeout }) => {
-                exit_result = Err(format!(
-                    "Login action ({}) timed out after {:?}; shutting down.",
-                    action, timeout
-                )
-                .into());
-                unsafe {
-                    if vm.canRequestStop() {
-                        if let Err(err) = vm.requestStopWithError() {
-                            eprintln!("Failed to request VM stop: {:?}", err);
-                        }
-                    } else if vm.canStop() {
-                        let handler = RcBlock::new(|_error: *mut NSError| {});
-                        vm.stopWithCompletionHandler(&handler);
+        // Wakeup pipe: supervisor writes one byte here to stop the reader thread.
+        let (wakeup_rd, wakeup_wr) = create_pipe();
+        let wakeup_rd_raw = wakeup_rd.as_raw_fd();
+        let hvc0_out_raw = we_read_from.as_raw_fd();
+        let hvc0_in_raw  = we_write_to.as_raw_fd();
+
+        // Reader: VM output → OutputMonitor (so login_actions_thread can Expect).
+        let reader_thread = {
+            let om = output_monitor.clone();
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    let mut fds = [
+                        libc::pollfd { fd: hvc0_out_raw, events: libc::POLLIN, revents: 0 },
+                        libc::pollfd { fd: wakeup_rd_raw, events: libc::POLLIN, revents: 0 },
+                    ];
+                    if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } < 0 { break; }
+                    if fds[1].revents & libc::POLLIN != 0 { break; }
+                    if fds[0].revents & libc::POLLIN != 0 {
+                        let n = unsafe { libc::read(hvc0_out_raw, buf.as_mut_ptr() as *mut _, buf.len()) };
+                        if n <= 0 { break; }
+                        om.push(&buf[..n as usize]);
                     }
                 }
+            })
+        };
+
+        // Writer: login_actions channel → VM input.
+        let (input_tx, input_rx) = mpsc::channel::<VmInput>();
+        let writer_thread = thread::spawn(move || {
+            loop {
+                match input_rx.recv() {
+                    Ok(VmInput::Bytes(data)) => {
+                        let mut offset = 0;
+                        while offset < data.len() {
+                            let n = unsafe { libc::write(hvc0_in_raw, data[offset..].as_ptr() as *const _, data.len() - offset) };
+                            if n < 0 { return; }
+                            offset += n as usize;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        let (vm_output_tx, vm_output_rx) = mpsc::channel::<VmOutput>();
+        let login_thread = spawn_login_actions_thread(
+            all_login_actions,
+            output_monitor,
+            input_tx,  // moved; dropped when login_thread exits → writer_thread exits
+            vm_output_tx,
+        );
+
+        // Channel used by the supervisor to report success or a timeout error.
+        let (done_tx, done_rx) = mpsc::channel::<Result<(), String>>();
+
+        let hvc0_sock        = console_path.with_file_name("hvc0.sock");
+        let hvc0_resize_sock = console_path.with_file_name("hvc0-resize.sock");
+
+        // Supervisor: waits for login actions, then hands hvc0 to a socket proxy.
+        thread::spawn(move || {
+            // login_thread drops input_tx on exit → writer_thread exits via Err on recv.
+            login_thread.join().ok();
+            writer_thread.join().ok();
+
+            // Stop the reader thread.
+            unsafe { libc::write(wakeup_wr.as_raw_fd(), b"x".as_ptr() as *const _, 1) };
+            reader_thread.join().ok();
+            drop(wakeup_rd); // safe to close now that reader has exited
+            drop(wakeup_wr);
+
+            match vm_output_rx.try_recv() {
+                Ok(VmOutput::LoginActionTimeout { action, timeout }) => {
+                    let _ = done_tx.send(Err(format!(
+                        "Login action ({action}) timed out after {timeout:?}; shutting down."
+                    )));
+                }
+                _ => {
+                    // Login actions succeeded; expose hvc0 via a detachable socket.
+                    spawn_console_socket_proxy(we_read_from, we_write_to, hvc0_sock);
+                    spawn_console_resize_proxy(we_write_resize_to, hvc0_resize_sock);
+                    let _ = done_tx.send(Ok(()));
+                }
+            }
+        });
+
+        // Main loop: keep pumping the run-loop so the VM stays alive.
+        let mut exit_result: Result<(), Box<dyn std::error::Error>> = Ok(());
+        loop {
+            unsafe {
+                NSRunLoop::mainRunLoop().runMode_beforeDate(
+                    NSDefaultRunLoopMode,
+                    &NSDate::dateWithTimeIntervalSinceNow(0.2),
+                )
+            };
+
+            match done_rx.try_recv() {
+                Ok(Err(msg)) => {
+                    exit_result = Err(msg.into());
+                    unsafe {
+                        if vm.canRequestStop() {
+                            vm.requestStopWithError().ok();
+                        } else if vm.canStop() {
+                            vm.stopWithCompletionHandler(&RcBlock::new(|_: *mut NSError| {}));
+                        }
+                    }
+                    break;
+                }
+                Ok(Ok(())) | Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => {}
+            }
+
+            if unsafe { vm.state() } != objc2_virtualization::VZVirtualMachineState::Running {
                 break;
             }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => {}
         }
-        if state != objc2_virtualization::VZVirtualMachineState::Running {
-            //eprintln!("VM stopped with state: {:?}", state);
-            break;
+        eprintln!("VM poweroff");
+
+        // Clean up all socket files.
+        let base = console_path;
+        for name in ["hvc0.sock", "hvc0-resize.sock"]
+            .iter()
+            .chain(CONSOLE_SOCK_NAMES.iter())
+            .chain(RESIZE_SOCK_NAMES.iter())
+        {
+            let _ = fs::remove_file(base.with_file_name(name));
         }
+
+        exit_result
+    } else {
+        // ── Provisioning mode ──────────────────────────────────────────────────
+        // Wire hvc0 directly to stdin/stdout so the operator can watch progress.
+        eprintln!("provisioning mode!?");
+
+        let output_monitor = Arc::new(OutputMonitor::default());
+        let io_ctx = spawn_vm_io(
+            output_monitor.clone(),
+            we_read_from,
+            we_write_to,
+            we_write_resize_to,
+        );
+
+        let (vm_output_tx, vm_output_rx) = mpsc::channel::<VmOutput>();
+        let login_actions_thread = spawn_login_actions_thread(
+            all_login_actions,
+            output_monitor,
+            io_ctx.input_tx.clone(),
+            vm_output_tx,
+        );
+
+        let mut exit_result: Result<(), Box<dyn std::error::Error>> = Ok(());
+        loop {
+            unsafe {
+                NSRunLoop::mainRunLoop().runMode_beforeDate(
+                    NSDefaultRunLoopMode,
+                    &NSDate::dateWithTimeIntervalSinceNow(0.2),
+                )
+            };
+
+            let state = unsafe { vm.state() };
+            match vm_output_rx.try_recv() {
+                Ok(VmOutput::LoginActionTimeout { action, timeout }) => {
+                    exit_result = Err(format!(
+                        "Login action ({action}) timed out after {timeout:?}; shutting down."
+                    )
+                    .into());
+                    unsafe {
+                        if vm.canRequestStop() {
+                            if let Err(err) = vm.requestStopWithError() {
+                                eprintln!("Failed to request VM stop: {:?}", err);
+                            }
+                        } else if vm.canStop() {
+                            let handler = RcBlock::new(|_error: *mut NSError| {});
+                            vm.stopWithCompletionHandler(&handler);
+                        }
+                    }
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => {}
+            }
+            if state != objc2_virtualization::VZVirtualMachineState::Running {
+                break;
+            }
+        }
+
+        login_actions_thread.join().ok();
+        io_ctx.shutdown();
+        exit_result
     }
-
-    let _ = login_actions_thread.join();
-
-    io_ctx.shutdown();
-
-    if let Some(ref path) = console_socket_path {
-        for name in CONSOLE_SOCK_NAMES.iter().chain(RESIZE_SOCK_NAMES.iter()) {
-            let _ = fs::remove_file(path.with_file_name(name));
-        }
-    }
-
-    exit_result
 }
 
 fn nsurl_from_path(path: &Path) -> Result<Retained<NSURL>, Box<dyn std::error::Error>> {
