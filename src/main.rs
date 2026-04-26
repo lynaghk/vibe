@@ -128,7 +128,7 @@ fn attach_console(
     instance_dir: PathBuf,
     login_actions: Vec<LoginAction>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("Attaching to console ...");
+    // eprintln!("Attaching to console ...");
     // Try each console slot in order; use the first one that isn't already busy.
     // The proxy sends "console is already attached\r\n" immediately when busy,
     // so a 150 ms poll is enough to distinguish busy from available.
@@ -1950,6 +1950,11 @@ fn run_vm(
                 }
                 _ => {
                     let (vm_out, vm_in, resize) = io_ctx.shutdown();
+                    // Write a single newline to trigger the display of the login prompt
+                    // as the original prompt has already been consumed
+                    unsafe {
+                         libc::write(vm_in.as_raw_fd(), "\n".as_ptr() as *const _, 1);
+                    };
                     spawn_console_socket_proxy(vm_out, vm_in, hvc0_sock);
                     spawn_console_resize_proxy(resize, hvc0_resize_sock);
                     let _ = done_tx.send(Ok(()));
