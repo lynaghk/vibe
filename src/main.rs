@@ -812,18 +812,18 @@ Options
         // The instance-lock file descriptor was opened without O_CLOEXEC, so the
         // daemon inherits it across the exec call and holds the lock for its entire
         // lifetime — preventing a second `vibe` from starting a second VM.
-        let log_file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(instance_dir.join("daemon.log"))?;
+        // let log_file = fs::OpenOptions::new()
+        //     .write(true)
+        //     .create(true)
+        //     .truncate(true)
+        //     .open(instance_dir.join("daemon.log"))?;
         // eprintln!("Spawning VM daemon...");
         Command::new(env::current_exe()?)
             .arg("--_daemon")
             .args(env::args_os().skip(1))
             .stdin(Stdio::null())
-            .stdout(log_file.try_clone()?)
-            .stderr(log_file)
+            // .stdout(log_file.try_clone()?)
+            // .stderr(log_file)
             .spawn()?;
 
         let deadline = Instant::now() + Duration::from_secs(300);
