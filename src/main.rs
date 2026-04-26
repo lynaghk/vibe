@@ -198,17 +198,13 @@ fn attach_console(
         }
     }
 
-    let _raw = enable_raw_mode(libc::STDIN_FILENO)
-        .map_err(|e| format!("Failed to enable raw mode: {e}"))?;
-
     let mut all_actions: Vec<LoginAction> =
         vec![
-            Send("".to_string()),
             Expect {
                 text: "login:".to_string(),
                 timeout: LOGIN_EXPECT_TIMEOUT,
             },
-            Send("@root".to_string()),
+            Send("root".to_string()),
             Expect {
                 text: "~#".to_string(),
                 timeout: LOGIN_EXPECT_TIMEOUT,
@@ -219,7 +215,9 @@ fn attach_console(
     let mut buf = [0u8; 4096];
     // Seed with any bytes already read during the busy-check poll.
     let mut output_buf = String::from_utf8_lossy(&prefetched).into_owned();
+    let mut raw_guard: Option<RawModeGuard> = None;
     if !prefetched.is_empty() {
+        raw_guard = enable_raw_mode(libc::STDIN_FILENO).ok();
         let mut stdout = std::io::stdout().lock();
         let _ = stdout.write_all(&prefetched);
         let _ = stdout.flush();
@@ -263,6 +261,9 @@ fn attach_console(
                         return Ok(());
                     }
                     let data = &buf[..n as usize];
+                    if raw_guard.is_none() {
+                        raw_guard = enable_raw_mode(libc::STDIN_FILENO).ok();
+                    }
                     let mut stdout = std::io::stdout().lock();
                     let _ = stdout.write_all(data);
                     let _ = stdout.flush();
@@ -308,54 +309,57 @@ fn attach_console(
         }
     }
 
-    // Interactive loop: bidirectional proxy until the socket closes or stdin EOF.
-    loop {
-        let mut fds = [
-            libc::pollfd {
-                fd: libc::STDIN_FILENO,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: stream_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
+    // Interactive loop: bidirectional proxy using poll_with_wakeup in two threads.
+    let (wakeup_read, wakeup_write) = create_pipe();
+    let raw_guard = Arc::new(Mutex::new(raw_guard));
 
-        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
-        if ret < 0 {
-            break;
-        }
-
-        if fds[0].revents & libc::POLLIN != 0 {
-            let n =
-                unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut _, buf.len()) };
-            if n <= 0 {
-                break;
-            }
-            if unsafe { libc::write(stream_fd, buf.as_ptr() as *const _, n as usize) } < 0 {
-                break;
+    let stdin_thread = thread::spawn({
+        let wakeup_read = wakeup_read.try_clone().unwrap();
+        let raw_guard = raw_guard.clone();
+        move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match poll_with_wakeup(libc::STDIN_FILENO, wakeup_read.as_raw_fd(), &mut buf) {
+                    PollResult::Shutdown | PollResult::Error => break,
+                    PollResult::Spurious => continue,
+                    PollResult::Ready(bytes) => {
+                        if raw_guard.lock().unwrap().is_none() {
+                            continue;
+                        }
+                        unsafe { libc::write(stream_fd, bytes.as_ptr() as *const _, bytes.len()); }
+                    }
+                }
             }
         }
+    });
 
-        if fds[1].revents & libc::POLLIN != 0 {
-            let n = unsafe { libc::read(stream_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
-            if n <= 0 {
-                break;
-            }
+    let socket_thread = thread::spawn({
+        let raw_guard = raw_guard.clone();
+        move || {
             let mut stdout = std::io::stdout().lock();
-            stdout.write_all(&buf[..n as usize])?;
-            stdout.flush()?;
+            let mut buf = [0u8; 4096];
+            loop {
+                match poll_with_wakeup(stream_fd, wakeup_read.as_raw_fd(), &mut buf) {
+                    PollResult::Shutdown | PollResult::Error => break,
+                    PollResult::Spurious => continue,
+                    PollResult::Ready(bytes) => {
+                        {
+                            let mut guard = raw_guard.lock().unwrap();
+                            if guard.is_none() {
+                                *guard = enable_raw_mode(libc::STDIN_FILENO).ok();
+                            }
+                        }
+                        let _ = stdout.write_all(bytes);
+                        let _ = stdout.flush();
+                    }
+                }
+            }
         }
+    });
 
-        if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-            break;
-        }
-        if fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-            break;
-        }
-    }
+    socket_thread.join().ok();
+    unsafe { libc::write(wakeup_write.as_raw_fd(), [0u8].as_ptr() as *const _, 1) };
+    stdin_thread.join().ok();
 
     Ok(())
 }
@@ -392,12 +396,9 @@ fn spawn_console_socket_proxy(hvc_out: OwnedFd, hvc_in: OwnedFd, socket_path: Pa
             let _stream = stream;
             let mut buf = [0u8; 4096];
 
-            // Discard client→guest data for a brief window after connecting.
-            // When the client receives buffered output (agetty's terminal queries),
-            // the host terminal emulator responds automatically — those responses
-            // would appear as garbage on the guest command line. Ignoring client
-            // input for ~300 ms lets those automatic responses arrive and be dropped.
-            // let ignore_client_input_until = Instant::now() + Duration::from_millis(300);
+            // unsafe {
+            //     libc::write(hvc_in_fd, "\n".as_ptr() as *const _, 1);
+            // };
 
             'client: loop {
                 let now = Instant::now();
@@ -450,10 +451,28 @@ fn spawn_console_socket_proxy(hvc_out: OwnedFd, hvc_in: OwnedFd, socket_path: Pa
                     // exits. Close the client socket so attach_console exits via normal
                     // socket-close detection. OSC 9999 won't appear in real terminal output.
                     const SENTINEL: &[u8] = b"\x1b]9999\x07";
-                    if buf[..n as usize].windows(SENTINEL.len()).any(|w| w == SENTINEL) {
+                    const DSR: &[u8] = b"\x1b[6n";
+                    let data = &buf[..n as usize];
+                    if data.windows(SENTINEL.len()).any(|w| w == SENTINEL) {
                         break 'client;
                     }
-                    if unsafe { libc::write(client_fd, buf.as_ptr() as *const _, n as usize) } < 0 {
+                    // Strip ESC[6n (DSR cursor-position query) — prevents spurious CPR
+                    // responses from leaking onto the client terminal.
+                    let mut filtered = Vec::with_capacity(data.len());
+                    let mut i = 0;
+                    while i < data.len() {
+                        if data[i..].starts_with(DSR) {
+                            i += DSR.len();
+                        } else {
+                            filtered.push(data[i]);
+                            i += 1;
+                        }
+                    }
+                    if !filtered.is_empty()
+                        && unsafe {
+                            libc::write(client_fd, filtered.as_ptr() as *const _, filtered.len())
+                        } < 0
+                    {
                         break 'client; // client disconnected
                     }
                 }
@@ -794,10 +813,12 @@ Options
 
     if !args.daemon {
         // We are the initial client.
-        // Sanity check that no VM is running:
         let hvc0_sock = instance_dir.join("hvc0.sock");
-        if hvc0_sock.exists() {
-            return Err("hvc0.sock exists".into());
+        if !args.attach {
+            // Sanity check that no VM is running:
+            if hvc0_sock.exists() {
+                return Err("hvc0.sock exists".into());
+            }
         }
 
         // Provision the VM if needed.
@@ -818,28 +839,27 @@ Options
         //     .truncate(true)
         //     .open(instance_dir.join("daemon.log"))?;
         // eprintln!("Spawning VM daemon...");
-        Command::new(env::current_exe()?)
-            .arg("--_daemon")
-            .args(env::args_os().skip(1))
-            .stdin(Stdio::null())
-            // .stdout(log_file.try_clone()?)
-            // .stderr(log_file)
-            .spawn()?;
+        if !parse_cli()?.attach {
+            Command::new(env::current_exe()?)
+                .arg("--_daemon")
+                .args(env::args_os().skip(1))
+                // .stdin(Stdio::null())
+                // .stdout(log_file.try_clone()?)
+                // .stderr(log_file)
+                .spawn()?;
+        }
 
         let deadline = Instant::now() + Duration::from_secs(300);
         let mut last_dot = Instant::now();
-        eprint!("VM booting.");
         while !hvc0_sock.exists() {
             if Instant::now() >= deadline {
                 return Err("client: Timed out waiting for VM daemon to finish booting".into());
             }
             if last_dot.elapsed() >= Duration::from_secs(5) {
-                eprint!(".");
                 last_dot = Instant::now();
             }
             thread::sleep(Duration::from_millis(200));
         }
-        eprintln!();
         attach_console(instance_dir, parse_cli()?.login_actions)
     } else {
         // We are the daemon process.
@@ -848,163 +868,6 @@ Options
         // The instance lock is already held via the inherited file descriptor.
         run_daemon_vm(args, instance_dir)
     }
-
-
-    // At this point the VM is provisioned. The VM is now powered off.
-    // if args.daemon {
-    //     We are the daemon process: run the VM and keep it alive.
-        // The instance lock is already held via the inherited file descriptor.
-        // return run_daemon_vm(args, &disk_path, prepare_network_backend, )
-        // return run_vm(
-        //     &disk_path,
-        //     prepare_network_backend,
-        //     args.cpu_count,
-        //     args.ram_bytes,
-        //     Some(instance_dir.join("console.sock")),
-        // );
-    // } else {
-    //
-    // }
-    // let mut login_actions = Vec::new();
-    // let mut directory_shares = Vec::new();
-
-    // if !args.no_default_mounts {
-    //     let abspath = env::current_dir()?
-    //         .into_os_string()
-    //         .to_string_lossy()
-    //         .into_owned();
-    //     login_actions.push(Send(format!(" cd {abspath}")));
-
-        // Discourage read/write of project dir subfolders within the VM.
-        // Note that this isn't secure, since the VM runs as root and could unmount this.
-        // I couldn't find an alternative way to do this --- the MacOS sandbox doesn't apply to the Apple Virtualization system =(
-        // for subfolder in [".git", ".vibe"] {
-        //     if project_root.join(subfolder).exists() {
-        //         login_actions.push(Send(format!(r" mount -t tmpfs tmpfs {}", subfolder)))
-        //     }
-        // }
-
-        // directory_shares.push(
-        //     DirectoryShare::new(project_root, env::current_dir()?, false)
-        //         .expect("Project directory must exist"),
-        // );
-
-        // for subfolder in [".venv", "node_modules"] {
-        //     if env::current_dir()?.join(subfolder).exists() {
-                // println!(r"creating mapping {}", subfolder);
-                // fs::create_dir_all(env::current_dir()?.join(".vibe").join(subfolder))
-                //     .expect("Could not create .vibe/ subfolder");
-                // directory_shares.push(
-                //     DirectoryShare::new(
-                //         env::current_dir()?.join(".vibe").join(subfolder),
-                //         env::current_dir()?.join(subfolder),
-                //         false,
-                //     )
-                //     .expect("Project directory must exist"),
-                // );
-            // }
-        // }
-
-        // directory_shares.push(mise_directory_share);
-
-        // Add default shares, if they exist
-        // for share in [
-        //     DirectoryShare::new(home.join(".m2"), "/root/.m2".into(), false),
-        //     DirectoryShare::new(
-        //         home.join(".cargo/registry"),
-        //         "/root/.cargo/registry".into(),
-        //         false,
-        //     ),
-        //     DirectoryShare::new(home.join(".codex"), "/root/.codex".into(), false),
-        //     DirectoryShare::new(home.join(".claude"), "/root/.claude".into(), false),
-        //     DirectoryShare::new(home.join(".gemini"), "/root/.gemini".into(), false),
-        // ]
-        // .into_iter()
-        // .flatten()
-        // {
-        //     directory_shares.push(share)
-        // }
-        // Bind-mount linux ripgrep over shared macos binary to ensure compatibility
-        // login_actions.push(Send(
-        //     " if [ -f /root/.gemini/tmp/bin/rg ] && [ -f /usr/bin/rg ]; then mount --bind /usr/bin/rg /root/.gemini/tmp/bin/rg; fi"
-        //         .to_string()
-        // ));
-    // }
-
-    // for spec in &args.mounts {
-    //     directory_shares.push(DirectoryShare::from_mount_spec(spec)?);
-    // }
-
-    // Enable bash history
-    // login_actions.push(Send(" export HISTFILE=/root/.bash_history".to_string()));
-
-    // if let Some(motd_action) = motd_login_action(&directory_shares) {
-    //     login_actions.push(motd_action);
-    // }
-
-    // Any user-provided login actions must come after our system ones
-    // login_actions.extend(args.login_actions);
-
-    // if args.daemon {
-    //     We are the daemon process: run the VM and keep it alive.
-    //     The instance lock is already held via the inherited file descriptor.
-        // return run_vm(
-        //     &disk_path,
-        //     &login_actions,
-        //     &directory_shares[..],
-        //     prepare_network_backend,
-        //     args.cpu_count,
-        //     args.ram_bytes,
-        //     Some(instance_dir.join("console.sock")),
-        // );
-    // }
-
-    // Spawn the daemon by re-execing this binary with --_daemon prepended to
-    // the original arguments.  Using Command::spawn (fork+exec) rather than a
-    // bare fork() is required on macOS: a raw fork leaves the child with a
-    // corrupted ObjC/GCD runtime, causing the Virtualization framework to fail
-    // with "Internal Virtualization error".  After exec the child starts fresh.
-    //
-    // The instance-lock file descriptor was opened without O_CLOEXEC, so the
-    // daemon inherits it across the exec call and holds the lock for its entire
-    // lifetime — preventing a second `vibe` from starting a second VM.
-    // let log_file = fs::OpenOptions::new()
-    //     .write(true)
-    //     .create(true)
-    //     .truncate(true)
-    //     .open(instance_dir.join("daemon.log"))?;
-    // eprintln!("client: Spawning VM daemon...");
-    // Command::new(env::current_exe()?)
-    //     .arg("--_daemon")
-    //     .args(env::args_os().skip(1))
-    //     .stdin(Stdio::null())
-    //     .stdout(log_file.try_clone()?)
-    //     .stderr(log_file)
-    //     .spawn()?;
-
-    // let hvc0_sock = instance_dir.join("hvc0.sock");
-    // let deadline = Instant::now() + Duration::from_secs(300);
-    // let mut last_dot = Instant::now();
-    // eprintln!("client: Waiting to attach.");
-    // let mut dots = 0;
-    // while !hvc0_sock.exists() {
-    //     if Instant::now() >= deadline {
-    //         return Err("client: Timed out waiting for VM daemon to finish booting".into());
-    //     }
-    //     if last_dot.elapsed() >= Duration::from_secs(5) {
-    //         dots += 1;
-    //         eprint!("client: Waiting to attach.");
-    //         let mut dots2 = dots;
-    //         while dots2 > 0 {
-    //             dots2 -= 1;
-    //             eprint!(".");
-    //         }
-    //         eprintln!();
-    //         last_dot = Instant::now();
-    //     }
-    //     thread::sleep(Duration::from_millis(200));
-    // }
-    // attach_console(instance_dir, login_actions)
 }
 
 struct CliArgs {
@@ -1012,6 +875,7 @@ struct CliArgs {
     version: bool,
     help: bool,
     daemon: bool,
+    attach: bool,
     no_default_mounts: bool,
     mounts: Vec<String>,
     login_actions: Vec<LoginAction>,
@@ -1032,6 +896,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
     let mut version = false;
     let mut help = false;
     let mut daemon = false;
+    let mut attach = false;
     let mut no_default_mounts = false;
     let mut mounts = Vec::new();
     let mut login_actions = Vec::new();
@@ -1045,6 +910,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
             Long("version") => version = true,
             Long("help") | Short('h') => help = true,
             Long("_daemon") => daemon = true,
+            Long("_attach") => attach = true,
             Long("no-default-mounts") => no_default_mounts = true,
             Long("cpus") => {
                 let value = os_to_string(parser.value()?, "--cpus")?.parse()?;
@@ -1100,6 +966,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         version,
         help,
         daemon,
+        attach,
         no_default_mounts,
         mounts,
         login_actions,
@@ -1383,6 +1250,44 @@ pub fn create_pipe() -> (OwnedFd, OwnedFd) {
     (read_stream.into(), write_stream.into())
 }
 
+enum PollResult<'a> {
+    Ready(&'a [u8]),
+    Spurious,
+    Shutdown,
+    Error,
+}
+
+fn poll_with_wakeup<'a>(main_fd: RawFd, wakeup_fd: RawFd, buf: &'a mut [u8]) -> PollResult<'a> {
+    let mut fds = [
+        libc::pollfd {
+            fd: main_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: wakeup_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+
+    let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+    if ret <= 0 || fds[1].revents & libc::POLLIN != 0 {
+        PollResult::Shutdown
+    } else if fds[0].revents & libc::POLLIN != 0 {
+        let n = unsafe { libc::read(main_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+        if n < 0 {
+            PollResult::Error
+        } else if n == 0 {
+            PollResult::Shutdown
+        } else {
+            PollResult::Ready(&buf[..(n as usize)])
+        }
+    } else {
+        PollResult::Spurious
+    }
+}
+
 pub fn spawn_vm_io(
     output_monitor: Arc<OutputMonitor>,
     vm_output_fd: OwnedFd,
@@ -1395,44 +1300,6 @@ pub fn spawn_vm_io(
     let raw_guard = Arc::new(Mutex::new(None));
 
     let (wakeup_read, wakeup_write) = create_pipe();
-
-    enum PollResult<'a> {
-        Ready(&'a [u8]),
-        Spurious,
-        Shutdown,
-        Error,
-    }
-
-    fn poll_with_wakeup<'a>(main_fd: RawFd, wakeup_fd: RawFd, buf: &'a mut [u8]) -> PollResult<'a> {
-        let mut fds = [
-            libc::pollfd {
-                fd: main_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: wakeup_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-
-        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
-        if ret <= 0 || fds[1].revents & libc::POLLIN != 0 {
-            PollResult::Shutdown
-        } else if fds[0].revents & libc::POLLIN != 0 {
-            let n = unsafe { libc::read(main_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
-            if n < 0 {
-                PollResult::Error
-            } else if n == 0 {
-                PollResult::Shutdown
-            } else {
-                PollResult::Ready(&buf[..(n as usize)])
-            }
-        } else {
-            PollResult::Spurious
-        }
-    }
 
     // Copies from stdin to the VM; also polls wakeup_read to exit the thread when it's time to shutdown.
     let stdin_thread = thread::spawn({
@@ -1945,7 +1812,6 @@ fn run_vm(
         for (i, (host_read, host_write, host_resize_write)) in
             host_console_fds.into_iter().enumerate()
         {
-            eprintln!("spawning proxy {}", i);
             spawn_console_socket_proxy(
                 host_read,
                 host_write,
@@ -2042,7 +1908,7 @@ fn run_vm(
     }
 
     if let Some(ref console_path) = console_socket_path {
-        eprintln!("Daemon mode ...");
+        // eprintln!("Daemon mode ...");
         // ── Daemon mode ────────────────────────────────────────────────────────
         // Use spawn_vm_io to wire hvc0 to stdin/stdout during boot so that boot
         // output is visible.  After login completes the supervisor shuts down
