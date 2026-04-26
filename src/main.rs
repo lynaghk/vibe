@@ -201,10 +201,6 @@ fn attach_console(
     let _raw = enable_raw_mode(libc::STDIN_FILENO)
         .map_err(|e| format!("Failed to enable raw mode: {e}"))?;
 
-    // hvc0.sock is the daemon's main console — the VM is already logged in and the
-    // shell is running, so no auto-login sequence is needed.  The extra getty
-    // consoles (console.sock / console1.sock / console2.sock → hvc2/4/6) still
-    // need the auto-login dance because a fresh getty session greets with "login:".
     let mut all_actions: Vec<LoginAction> =
         vec![
             Send("".to_string()),
@@ -212,7 +208,7 @@ fn attach_console(
                 text: "login:".to_string(),
                 timeout: LOGIN_EXPECT_TIMEOUT,
             },
-            Send("root".to_string()),
+            Send("@root".to_string()),
             Expect {
                 text: "~#".to_string(),
                 timeout: LOGIN_EXPECT_TIMEOUT,
@@ -2004,31 +2000,26 @@ fn run_vm(
             "bash_logout.sh",
             BASH_LOGOUT_SCRIPT,
         )?));
-        // all_login_actions.push(Send(" stty -F /dev/hvc2 sane".to_string()));
-        // all_login_actions.push(Send(" (while true; do setsid bash -c 'exec bash --login < /dev/hvc0 > /dev/hvc0 2>&1'; done) &".to_string()));
-        // all_login_actions.push(Send(" (while true; do setsid bash -c 'exec bash --login < /dev/hvc2 > /dev/hvc2 2>&1'; done) &".to_string()));
-        // all_login_actions.push(Send(" (while true; do setsid bash -c 'exec bash --login < /dev/hvc4 > /dev/hvc4 2>&1'; done) &".to_string()));
-        // all_login_actions.push(Send(" (while true; do setsid bash -c 'exec bash --login < /dev/hvc6 > /dev/hvc6 2>&1'; done) &".to_string()));
-        // Configure autologin for hvc0 so reconnects after the user types `exit` are seamless.
-        // %%I in the printf format becomes %I in the written file (systemd unit specifier).
-        // all_login_actions.push(Send(
-        //     " mkdir -p /etc/systemd/system/serial-getty@hvc0.service.d && \
-        //       printf '[Service]\\nExecStart=\\nExecStart=-/sbin/agetty --clear --autologin root %%I xterm-256color\\n' \
-        //         > /etc/systemd/system/serial-getty@hvc0.service.d/autologin.conf"
-        //         .to_string(),
-        // ));
         // Configure and enable all N_CONSOLE_SLOTS getty services in one shot.
+        all_login_actions.push(Send(
+            " for d in hvc0 hvc2 hvc4 hvc6; do \
+              mkdir -p /etc/systemd/system/serial-getty@${d}.service.d && \
+              printf '[Service]\\nExecStart=\\nExecStart=-/sbin/agetty --8bits --kill-chars @ --noclear %%I linux\\n' \
+                > /etc/systemd/system/serial-getty@${d}.service.d/autologin.conf; \
+              done"
+                .to_string(),
+        ));
+        all_login_actions.push(Send(
+            " systemctl daemon-reload && systemctl enable --now \
+              serial-getty@hvc0.service \
+              serial-getty@hvc2.service \
+              serial-getty@hvc4.service \
+              serial-getty@hvc6.service"
+                .to_string(),
+        ));
+        // Start getty on hvc2/4/6 so attach_console can connect to them.
         // all_login_actions.push(Send(
-        //     " for d in hvc0 hvc2 hvc4 hvc6; do \
-        //       mkdir -p /etc/systemd/system/serial-getty@${d}.service.d && \
-        //       printf '[Service]\\nExecStart=\\nExecStart=-/sbin/agetty --8bits --noclear %%I xterm-256color\\n' \
-        //         > /etc/systemd/system/serial-getty@${d}.service.d/autologin.conf; \
-        //       done"
-        //         .to_string(),
-        // ));
-        // all_login_actions.push(Send(
-        //     " systemctl daemon-reload && systemctl enable --now \
-        //       serial-getty@hvc2.service serial-getty@hvc4.service serial-getty@hvc6.service"
+        //     " systemctl start serial-getty@hvc2.service serial-getty@hvc4.service serial-getty@hvc6.service"
         //         .to_string(),
         // ));
         // Resize handlers: read resize events from hvcN+1 and apply them to hvcN.
