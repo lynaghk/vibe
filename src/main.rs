@@ -140,7 +140,6 @@ fn attach_console(
     let mut chosen_stream: Option<UnixStream> = None;
     let mut chosen_resize_path: Option<PathBuf> = None;
     let mut prefetched: Vec<u8> = Vec::new();
-    let mut chosen_name: &str = "";
 
     for name in &SOCK_NAMES {
         let path = instance_dir.join(name);
@@ -172,7 +171,6 @@ fn attach_console(
         let resize_name = name.replace(".sock", "-resize.sock");
         chosen_resize_path = Some(instance_dir.join(resize_name));
         chosen_stream = Some(s);
-        chosen_name = name;
         break;
     }
 
@@ -181,7 +179,6 @@ fn attach_console(
     )?;
     let stream_fd = stream.as_raw_fd();
     let _stream = stream;
-    let connect_time = Instant::now();
 
     // Send terminal resize events over the matching resize socket.
     let resize_socket_path = chosen_resize_path.unwrap_or_else(|| instance_dir.join("console-resize.sock"));
@@ -208,8 +205,9 @@ fn attach_console(
     // shell is running, so no auto-login sequence is needed.  The extra getty
     // consoles (console.sock / console1.sock / console2.sock → hvc2/4/6) still
     // need the auto-login dance because a fresh getty session greets with "login:".
-    let mut all_actions: Vec<LoginAction> = if chosen_name == "hvc0.sock" {
+    let mut all_actions: Vec<LoginAction> =
         vec![
+            Send("".to_string()),
             Expect {
                 text: "login:".to_string(),
                 timeout: LOGIN_EXPECT_TIMEOUT,
@@ -219,20 +217,7 @@ fn attach_console(
                 text: "~#".to_string(),
                 timeout: LOGIN_EXPECT_TIMEOUT,
             },
-        ]
-    } else {
-        vec![
-            Expect {
-                text: "login:".to_string(),
-                timeout: LOGIN_EXPECT_TIMEOUT,
-            },
-            Send("root".to_string()),
-            Expect {
-                text: "~#".to_string(),
-                timeout: LOGIN_EXPECT_TIMEOUT,
-            },
-        ]
-    };
+        ];
     all_actions.extend(login_actions);
 
     let mut buf = [0u8; 4096];
@@ -292,6 +277,8 @@ fn attach_console(
         }};
     }
 
+    let connect_time = Instant::now();
+
     for action in all_actions {
         match action {
             Expect { text, timeout } => {
@@ -312,24 +299,11 @@ fn attach_console(
                 }
             }
             Send(text) => {
-                // Ensure the proxy's 350 ms post-connect discard window has passed before
-                // sending, so automatic terminal-emulator responses (from the initial burst
-                // of escape sequences) have already been discarded and our input isn't.
-                let elapsed = connect_time.elapsed();
-                let window = Duration::from_millis(350);
-                if elapsed < window {
-                    thread::sleep(window - elapsed);
-                }
                 let mut bytes = text.into_bytes();
                 bytes.push(b'\n');
                 unsafe { libc::write(stream_fd, bytes.as_ptr() as *const _, bytes.len()) };
             }
             Script { path, index } => {
-                let elapsed = connect_time.elapsed();
-                let window = Duration::from_millis(350);
-                if elapsed < window {
-                    thread::sleep(window - elapsed);
-                }
                 let command = script_command_from_path(&path, index)?;
                 let mut bytes = command.into_bytes();
                 bytes.push(b'\n');
@@ -427,18 +401,18 @@ fn spawn_console_socket_proxy(hvc_out: OwnedFd, hvc_in: OwnedFd, socket_path: Pa
             // the host terminal emulator responds automatically — those responses
             // would appear as garbage on the guest command line. Ignoring client
             // input for ~300 ms lets those automatic responses arrive and be dropped.
-            let ignore_client_input_until = Instant::now() + Duration::from_millis(300);
+            // let ignore_client_input_until = Instant::now() + Duration::from_millis(300);
 
             'client: loop {
                 let now = Instant::now();
-                let poll_timeout_ms: i32 = if now < ignore_client_input_until {
-                    ignore_client_input_until
-                        .duration_since(now)
-                        .as_millis()
-                        .min(300) as i32
-                } else {
-                    -1
-                };
+                // let poll_timeout_ms: i32 = if now < ignore_client_input_until {
+                //     ignore_client_input_until
+                //         .duration_since(now)
+                //         .as_millis()
+                //         .min(300) as i32
+                // } else {
+                //     -1
+                // };
 
                 let mut fds = [
                     libc::pollfd {
@@ -458,7 +432,7 @@ fn spawn_console_socket_proxy(hvc_out: OwnedFd, hvc_in: OwnedFd, socket_path: Pa
                     },
                 ];
 
-                let ret = unsafe { libc::poll(fds.as_mut_ptr(), 3, poll_timeout_ms) };
+                let ret = unsafe { libc::poll(fds.as_mut_ptr(), 3, -1) };
                 if ret < 0 {
                     break 'client;
                 }
@@ -493,9 +467,7 @@ fn spawn_console_socket_proxy(hvc_out: OwnedFd, hvc_in: OwnedFd, socket_path: Pa
                     if n <= 0 {
                         break 'client; // client disconnected
                     }
-                    if Instant::now() < ignore_client_input_until {
-                        // Still in the ignore window — discard automatic terminal responses.
-                    } else if unsafe {
+                    if unsafe {
                         libc::write(hvc_in_fd, buf.as_ptr() as *const _, n as usize)
                     } < 0
                     {
@@ -581,11 +553,11 @@ fn try_acquire_instance_lock(instance_dir: &Path) -> io::Result<Option<libc::c_i
     }
 
     if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        eprintln!("client: Acquired instance.lock");
+        // eprintln!("Acquired instance.lock");
         Ok(Some(fd)) // caller must keep fd open; do NOT wrap in OwnedFd
     } else {
         unsafe { libc::close(fd) };
-        eprintln!("client: Lock already held");
+        // eprintln!("Lock already held");
         Ok(None)
     }
 }
@@ -681,8 +653,11 @@ fn run_daemon_vm(args: CliArgs, instance_dir: PathBuf) -> Result<(), Box<dyn std
         login_actions.push(motd_action);
     }
 
-    // Any user-provided login actions must come after our system ones
-    login_actions.extend(args.login_actions);
+    login_actions.push(Send(" exit".to_string()));
+    login_actions.push(Expect {
+        text: "login:".to_string(),
+        timeout: LOGIN_EXPECT_TIMEOUT,
+    });
 
     let instance_raw = instance_dir.join("instance.raw");
 
@@ -695,8 +670,7 @@ fn run_daemon_vm(args: CliArgs, instance_dir: PathBuf) -> Result<(), Box<dyn std
         instance_raw
     };
 
-
-    return run_vm(
+    run_vm(
         &disk_path,
         &login_actions,
         &directory_shares[..],
@@ -704,7 +678,7 @@ fn run_daemon_vm(args: CliArgs, instance_dir: PathBuf) -> Result<(), Box<dyn std
         args.cpu_count,
         args.ram_bytes,
         Some(instance_dir.join("console.sock")),
-    );
+    )
 }
 
 fn provision_vm(args: CliArgs, instance_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
@@ -847,7 +821,7 @@ Options
             .create(true)
             .truncate(true)
             .open(instance_dir.join("daemon.log"))?;
-        eprintln!("Spawning VM daemon...");
+        // eprintln!("Spawning VM daemon...");
         Command::new(env::current_exe()?)
             .arg("--_daemon")
             .args(env::args_os().skip(1))
@@ -858,7 +832,7 @@ Options
 
         let deadline = Instant::now() + Duration::from_secs(300);
         let mut last_dot = Instant::now();
-        eprintln!("Waiting for VM");
+        eprint!("VM booting.");
         while !hvc0_sock.exists() {
             if Instant::now() >= deadline {
                 return Err("client: Timed out waiting for VM daemon to finish booting".into());
@@ -869,10 +843,12 @@ Options
             }
             thread::sleep(Duration::from_millis(200));
         }
+        eprintln!();
         attach_console(instance_dir, parse_cli()?.login_actions)
     } else {
+        // We are the daemon process.
         // At this point the VM is provisioned. The VM is now powered off.
-        // We are the daemon process: run the VM and keep it alive.
+        // Run the VM and keep it alive.
         // The instance lock is already held via the inherited file descriptor.
         run_daemon_vm(args, instance_dir)
     }
@@ -1997,6 +1973,9 @@ fn run_vm(
         // Our terminal is connected via /dev/hvc0 which Debian apparently keeps barebones.
         // We want sane terminal defaults like icrnl (translating carriage returns into newlines)
         Send(" stty -F /dev/hvc0 sane".to_string()),
+        Send(" stty -F /dev/hvc2 sane".to_string()),
+        Send(" stty -F /dev/hvc4 sane".to_string()),
+        Send(" stty -F /dev/hvc6 sane".to_string()),
         // In background, continuously read host terminal resizes sent over hvc1 and update hvc0.
         Send({
             // sorry for this nonsense, the string is so long it angers rustfmt =(
@@ -2025,28 +2004,33 @@ fn run_vm(
             "bash_logout.sh",
             BASH_LOGOUT_SCRIPT,
         )?));
+        // all_login_actions.push(Send(" stty -F /dev/hvc2 sane".to_string()));
+        // all_login_actions.push(Send(" (while true; do setsid bash -c 'exec bash --login < /dev/hvc0 > /dev/hvc0 2>&1'; done) &".to_string()));
+        // all_login_actions.push(Send(" (while true; do setsid bash -c 'exec bash --login < /dev/hvc2 > /dev/hvc2 2>&1'; done) &".to_string()));
+        // all_login_actions.push(Send(" (while true; do setsid bash -c 'exec bash --login < /dev/hvc4 > /dev/hvc4 2>&1'; done) &".to_string()));
+        // all_login_actions.push(Send(" (while true; do setsid bash -c 'exec bash --login < /dev/hvc6 > /dev/hvc6 2>&1'; done) &".to_string()));
         // Configure autologin for hvc0 so reconnects after the user types `exit` are seamless.
         // %%I in the printf format becomes %I in the written file (systemd unit specifier).
         // all_login_actions.push(Send(
         //     " mkdir -p /etc/systemd/system/serial-getty@hvc0.service.d && \
-        //       printf '[Service]\\nExecStart=\\nExecStart=-/sbin/agetty --noclear --autologin root %%I xterm-256color\\n' \
+        //       printf '[Service]\\nExecStart=\\nExecStart=-/sbin/agetty --clear --autologin root %%I xterm-256color\\n' \
         //         > /etc/systemd/system/serial-getty@hvc0.service.d/autologin.conf"
         //         .to_string(),
         // ));
         // Configure and enable all N_CONSOLE_SLOTS getty services in one shot.
-        all_login_actions.push(Send(
-            " for d in hvc0 hvc2 hvc4 hvc6; do \
-              mkdir -p /etc/systemd/system/serial-getty@${d}.service.d && \
-              printf '[Service]\\nExecStart=\\nExecStart=-/sbin/agetty --noclear %%I xterm-256color\\n' \
-                > /etc/systemd/system/serial-getty@${d}.service.d/autologin.conf; \
-              done"
-                .to_string(),
-        ));
-        all_login_actions.push(Send(
-            " systemctl daemon-reload && systemctl enable --now \
-              serial-getty@hvc2.service serial-getty@hvc4.service serial-getty@hvc6.service"
-                .to_string(),
-        ));
+        // all_login_actions.push(Send(
+        //     " for d in hvc0 hvc2 hvc4 hvc6; do \
+        //       mkdir -p /etc/systemd/system/serial-getty@${d}.service.d && \
+        //       printf '[Service]\\nExecStart=\\nExecStart=-/sbin/agetty --8bits --noclear %%I xterm-256color\\n' \
+        //         > /etc/systemd/system/serial-getty@${d}.service.d/autologin.conf; \
+        //       done"
+        //         .to_string(),
+        // ));
+        // all_login_actions.push(Send(
+        //     " systemctl daemon-reload && systemctl enable --now \
+        //       serial-getty@hvc2.service serial-getty@hvc4.service serial-getty@hvc6.service"
+        //         .to_string(),
+        // ));
         // Resize handlers: read resize events from hvcN+1 and apply them to hvcN.
         for (console, resize) in [(2u8, 3u8), (4, 5), (6, 7)] {
             all_login_actions.push(Send(format!(
@@ -2062,7 +2046,7 @@ fn run_vm(
     }
 
     if let Some(ref console_path) = console_socket_path {
-        eprintln!("daemon mode ...");
+        eprintln!("Daemon mode ...");
         // ── Daemon mode ────────────────────────────────────────────────────────
         // Drive login actions internally (no stdin/stdout) via a pair of threads
         // that read/write the hvc0 pipe directly.  After login completes a
@@ -2202,7 +2186,6 @@ fn run_vm(
     } else {
         // ── Provisioning mode ──────────────────────────────────────────────────
         // Wire hvc0 directly to stdin/stdout so the operator can watch progress.
-        eprintln!("provisioning mode!?");
 
         let output_monitor = Arc::new(OutputMonitor::default());
         let io_ctx = spawn_vm_io(
