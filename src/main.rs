@@ -1373,9 +1373,9 @@ pub struct IoContext {
     pub input_tx: Sender<VmInput>,
     wakeup_write: OwnedFd,
     stdin_thread: thread::JoinHandle<()>,
-    mux_thread: thread::JoinHandle<()>,
-    resize_thread: thread::JoinHandle<()>,
-    stdout_thread: thread::JoinHandle<()>,
+    mux_thread: thread::JoinHandle<OwnedFd>,
+    resize_thread: thread::JoinHandle<OwnedFd>,
+    stdout_thread: thread::JoinHandle<OwnedFd>,
 }
 
 pub fn create_pipe() -> (OwnedFd, OwnedFd) {
@@ -1465,7 +1465,7 @@ pub fn spawn_vm_io(
         let raw_guard = raw_guard.clone();
         let wakeup_read = wakeup_read.try_clone().unwrap();
 
-        move || {
+        move || -> OwnedFd {
             let mut stdout = std::io::stdout().lock();
             let mut buf = [0u8; 1024];
             loop {
@@ -1491,11 +1491,12 @@ pub fn spawn_vm_io(
                     }
                 }
             }
+            vm_output_fd
         }
     });
 
     // Copies data from mpsc channel into VM, so vibe can "type" stuff and run scripts.
-    let mux_thread = thread::spawn(move || {
+    let mux_thread = thread::spawn(move || -> OwnedFd {
         let mut vm_writer = std::fs::File::from(vm_input_fd);
         loop {
             match input_rx.recv() {
@@ -1505,15 +1506,15 @@ pub fn spawn_vm_io(
                         break;
                     }
                 }
-                Ok(VmInput::Shutdown) => break,
-                Err(_) => break,
+                Ok(VmInput::Shutdown) | Err(_) => break,
             }
         }
+        vm_writer.into()
     });
 
     let resize_thread = thread::spawn({
         let wakeup_read = wakeup_read.try_clone().unwrap();
-        move || {
+        move || -> OwnedFd {
             let mut writer = std::fs::File::from(resize_control_fd);
             let resize_fd = writer.as_raw_fd();
             let flags = unsafe { libc::fcntl(resize_fd, libc::F_GETFL) };
@@ -1547,6 +1548,7 @@ pub fn spawn_vm_io(
                     }
                 }
             }
+            writer.into()
         }
     });
 
@@ -1561,13 +1563,16 @@ pub fn spawn_vm_io(
 }
 
 impl IoContext {
-    pub fn shutdown(self) {
+    /// Shut down all I/O threads and return the raw hvc0 FDs so they can be
+    /// handed off to a socket proxy: `(vm_output_fd, vm_input_fd, resize_fd)`.
+    pub fn shutdown(self) -> (OwnedFd, OwnedFd, OwnedFd) {
         let _ = self.input_tx.send(VmInput::Shutdown);
         unsafe { libc::write(self.wakeup_write.as_raw_fd(), b"x".as_ptr() as *const _, 1) };
         let _ = self.stdin_thread.join();
-        let _ = self.stdout_thread.join();
-        let _ = self.mux_thread.join();
-        let _ = self.resize_thread.join();
+        let vm_out = self.stdout_thread.join().expect("stdout_thread panicked");
+        let vm_in = self.mux_thread.join().expect("mux_thread panicked");
+        let resize = self.resize_thread.join().expect("resize_thread panicked");
+        (vm_out, vm_in, resize)
     }
 }
 
@@ -2004,7 +2009,7 @@ fn run_vm(
         all_login_actions.push(Send(
             " for d in hvc0 hvc2 hvc4 hvc6; do \
               mkdir -p /etc/systemd/system/serial-getty@${d}.service.d && \
-              printf '[Service]\\nExecStart=\\nExecStart=-/sbin/agetty --8bits --kill-chars @ --noclear %%I linux\\n' \
+              printf '[Service]\\nExecStart=\\nExecStart=-/sbin/agetty --8bits --kill-chars @ --noclear - linux\\n' \
                 > /etc/systemd/system/serial-getty@${d}.service.d/autologin.conf; \
               done"
                 .to_string(),
@@ -2039,63 +2044,24 @@ fn run_vm(
     if let Some(ref console_path) = console_socket_path {
         eprintln!("Daemon mode ...");
         // ── Daemon mode ────────────────────────────────────────────────────────
-        // Drive login actions internally (no stdin/stdout) via a pair of threads
-        // that read/write the hvc0 pipe directly.  After login completes a
-        // supervisor thread hands the pipe FDs over to a socket proxy so that
-        // `attach_console` can connect just like it does for hvc2/4/6.
+        // Use spawn_vm_io to wire hvc0 to stdin/stdout during boot so that boot
+        // output is visible.  After login completes the supervisor shuts down
+        // spawn_vm_io, recovers the raw hvc0 FDs, and hands them to the socket
+        // proxy so that `attach_console` can connect.
 
         let output_monitor = Arc::new(OutputMonitor::default());
-
-        // Wakeup pipe: supervisor writes one byte here to stop the reader thread.
-        let (wakeup_rd, wakeup_wr) = create_pipe();
-        let wakeup_rd_raw = wakeup_rd.as_raw_fd();
-        let hvc0_out_raw = we_read_from.as_raw_fd();
-        let hvc0_in_raw  = we_write_to.as_raw_fd();
-
-        // Reader: VM output → OutputMonitor (so login_actions_thread can Expect).
-        let reader_thread = {
-            let om = output_monitor.clone();
-            thread::spawn(move || {
-                let mut buf = [0u8; 4096];
-                loop {
-                    let mut fds = [
-                        libc::pollfd { fd: hvc0_out_raw, events: libc::POLLIN, revents: 0 },
-                        libc::pollfd { fd: wakeup_rd_raw, events: libc::POLLIN, revents: 0 },
-                    ];
-                    if unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) } < 0 { break; }
-                    if fds[1].revents & libc::POLLIN != 0 { break; }
-                    if fds[0].revents & libc::POLLIN != 0 {
-                        let n = unsafe { libc::read(hvc0_out_raw, buf.as_mut_ptr() as *mut _, buf.len()) };
-                        if n <= 0 { break; }
-                        om.push(&buf[..n as usize]);
-                    }
-                }
-            })
-        };
-
-        // Writer: login_actions channel → VM input.
-        let (input_tx, input_rx) = mpsc::channel::<VmInput>();
-        let writer_thread = thread::spawn(move || {
-            loop {
-                match input_rx.recv() {
-                    Ok(VmInput::Bytes(data)) => {
-                        let mut offset = 0;
-                        while offset < data.len() {
-                            let n = unsafe { libc::write(hvc0_in_raw, data[offset..].as_ptr() as *const _, data.len() - offset) };
-                            if n < 0 { return; }
-                            offset += n as usize;
-                        }
-                    }
-                    _ => break,
-                }
-            }
-        });
+        let io_ctx = spawn_vm_io(
+            output_monitor.clone(),
+            we_read_from,
+            we_write_to,
+            we_write_resize_to,
+        );
 
         let (vm_output_tx, vm_output_rx) = mpsc::channel::<VmOutput>();
         let login_thread = spawn_login_actions_thread(
             all_login_actions,
             output_monitor,
-            input_tx,  // moved; dropped when login_thread exits → writer_thread exits
+            io_ctx.input_tx.clone(),
             vm_output_tx,
         );
 
@@ -2105,17 +2071,10 @@ fn run_vm(
         let hvc0_sock        = console_path.with_file_name("hvc0.sock");
         let hvc0_resize_sock = console_path.with_file_name("hvc0-resize.sock");
 
-        // Supervisor: waits for login actions, then hands hvc0 to a socket proxy.
+        // Supervisor: waits for login actions, shuts down spawn_vm_io, then
+        // hands the recovered hvc0 FDs to a socket proxy.
         thread::spawn(move || {
-            // login_thread drops input_tx on exit → writer_thread exits via Err on recv.
             login_thread.join().ok();
-            writer_thread.join().ok();
-
-            // Stop the reader thread.
-            unsafe { libc::write(wakeup_wr.as_raw_fd(), b"x".as_ptr() as *const _, 1) };
-            reader_thread.join().ok();
-            drop(wakeup_rd); // safe to close now that reader has exited
-            drop(wakeup_wr);
 
             match vm_output_rx.try_recv() {
                 Ok(VmOutput::LoginActionTimeout { action, timeout }) => {
@@ -2124,9 +2083,9 @@ fn run_vm(
                     )));
                 }
                 _ => {
-                    // Login actions succeeded; expose hvc0 via a detachable socket.
-                    spawn_console_socket_proxy(we_read_from, we_write_to, hvc0_sock);
-                    spawn_console_resize_proxy(we_write_resize_to, hvc0_resize_sock);
+                    let (vm_out, vm_in, resize) = io_ctx.shutdown();
+                    spawn_console_socket_proxy(vm_out, vm_in, hvc0_sock);
+                    spawn_console_resize_proxy(resize, hvc0_resize_sock);
                     let _ = done_tx.send(Ok(()));
                 }
             }
