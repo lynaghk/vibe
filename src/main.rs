@@ -125,10 +125,11 @@ impl DirectoryShare {
 }
 
 fn attach_console(
-    instance_dir: PathBuf,
+    project_root: PathBuf,
     login_actions: Vec<LoginAction>,
     clear: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let instance_dir = project_root.join(".vibe");
     // eprintln!("Attaching to console ...");
     // Try each console slot in order; use the first one that isn't already busy.
     // The proxy sends "console is already attached\r\n" immediately when busy,
@@ -211,6 +212,13 @@ fn attach_console(
                 timeout: LOGIN_EXPECT_TIMEOUT,
             },
         ];
+
+    let abspath = env::current_dir()?
+        .into_os_string()
+        .to_string_lossy()
+        .into_owned();
+    all_actions.push(Send(format!(" cd {abspath}")));
+
     if clear {
         all_actions.push(Send(" clear && cat /etc/vibe_motd".to_string()));
     } else {
@@ -816,7 +824,7 @@ Options
         match try_acquire_instance_lock(&instance_dir)
             .map_err(|e| format!("Could not open instance lock: {e}"))?
         {
-            None => return attach_console(instance_dir, args.login_actions, args.clear),
+            None => return attach_console(project_root, args.login_actions, args.clear),
             Some(fd) => Some(fd),
             // fd is intentionally leaked here: it must stay open so the daemon
             // inherits it across exec and continues to hold the lock.
@@ -868,7 +876,7 @@ Options
             }
             thread::sleep(Duration::from_millis(200));
         }
-        attach_console(instance_dir, parse_cli()?.login_actions, parse_cli()?.clear)
+        attach_console(project_root, parse_cli()?.login_actions, parse_cli()?.clear)
     } else {
         // We are the daemon process.
         // At this point the VM is provisioned. The VM is now powered off.
