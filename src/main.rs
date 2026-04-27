@@ -209,6 +209,7 @@ fn attach_console(
                 text: "~#".to_string(),
                 timeout: LOGIN_EXPECT_TIMEOUT,
             },
+            Send(" cat /etc/vibe_motd".to_string()),
         ];
     all_actions.extend(login_actions);
 
@@ -273,8 +274,6 @@ fn attach_console(
             }
         }};
     }
-
-    let connect_time = Instant::now();
 
     for action in all_actions {
         match action {
@@ -668,6 +667,12 @@ fn run_daemon_vm(args: CliArgs, instance_dir: PathBuf) -> Result<(), Box<dyn std
         login_actions.push(motd_action);
     }
 
+    const S: &str = " bash -c '(while true; do sleep 3; if [[ \"$(who | wc -l | tr -d \" \")\" == \"0\" ]]; then echo \"VM powering off...\"; systemctl poweroff; fi; done) 2>&1 &'";
+    login_actions.push(Send(S.to_string()));
+
+    // temporarily disable automatic poweroff when logging out
+    login_actions.push(Send(" export VIBE_POWEROFF=false".to_string()));
+
     login_actions.push(Send(" exit".to_string()));
     login_actions.push(Expect {
         text: "login:".to_string(),
@@ -849,14 +854,10 @@ Options
                 .spawn()?;
         }
 
-        let deadline = Instant::now() + Duration::from_secs(300);
-        let mut last_dot = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(300); // 5 minute timeout
         while !hvc0_sock.exists() {
             if Instant::now() >= deadline {
                 return Err("client: Timed out waiting for VM daemon to finish booting".into());
-            }
-            if last_dot.elapsed() >= Duration::from_secs(5) {
-                last_dot = Instant::now();
             }
             thread::sleep(Duration::from_millis(200));
         }
@@ -1065,7 +1066,7 @@ fn motd_login_action(directory_shares: &[DirectoryShare]) -> Option<LoginAction>
         ));
     }
 
-    let command = format!(" cat <<'VIBE_MOTD'\n{output}\nVIBE_MOTD");
+    let command = format!(" cat <<'VIBE_MOTD' > /etc/vibe_motd\n{output}\nVIBE_MOTD\n");
     Some(Send(command))
 }
 
@@ -1872,27 +1873,27 @@ fn run_vm(
             BASH_LOGOUT_SCRIPT,
         )?));
         // Configure and enable all N_CONSOLE_SLOTS getty services in one shot.
-        all_login_actions.push(Send(
-            " for d in hvc0 hvc2 hvc4 hvc6; do \
-              mkdir -p /etc/systemd/system/serial-getty@${d}.service.d && \
-              printf '[Service]\\nExecStart=\\nExecStart=-/sbin/agetty --8bits --kill-chars @ --noclear - linux\\n' \
-                > /etc/systemd/system/serial-getty@${d}.service.d/autologin.conf; \
-              done"
-                .to_string(),
-        ));
-        all_login_actions.push(Send(
-            " systemctl daemon-reload && systemctl enable --now \
-              serial-getty@hvc0.service \
-              serial-getty@hvc2.service \
-              serial-getty@hvc4.service \
-              serial-getty@hvc6.service"
-                .to_string(),
-        ));
-        // Start getty on hvc2/4/6 so attach_console can connect to them.
         // all_login_actions.push(Send(
-        //     " systemctl start serial-getty@hvc2.service serial-getty@hvc4.service serial-getty@hvc6.service"
+        //     " for d in hvc0 hvc2 hvc4 hvc6; do \
+        //       mkdir -p /etc/systemd/system/serial-getty@${d}.service.d && \
+        //       printf '[Service]\\nExecStart=\\nExecStart=-/sbin/agetty --nonewline --8bits --noissue --noclear - linux\\n' \
+        //         > /etc/systemd/system/serial-getty@${d}.service.d/autologin.conf; \
+        //       done"
         //         .to_string(),
         // ));
+        // all_login_actions.push(Send(
+        //     " systemctl daemon-reload && systemctl enable --now \
+        //       serial-getty@hvc0.service \
+        //       serial-getty@hvc2.service \
+        //       serial-getty@hvc4.service \
+        //       serial-getty@hvc6.service"
+        //         .to_string(),
+        // ));
+        // Start getty on hvc2/4/6 so attach_console can connect to them.
+        all_login_actions.push(Send(
+            " systemctl start serial-getty@hvc2.service serial-getty@hvc4.service serial-getty@hvc6.service"
+                .to_string(),
+        ));
         // Resize handlers: read resize events from hvcN+1 and apply them to hvcN.
         for (console, resize) in [(2u8, 3u8), (4, 5), (6, 7)] {
             all_login_actions.push(Send(format!(
@@ -1991,7 +1992,7 @@ fn run_vm(
                 break;
             }
         }
-        eprintln!("VM poweroff");
+        // eprintln!("VM poweroff");
 
         // Clean up all socket files.
         let base = console_path;
