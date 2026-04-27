@@ -9,7 +9,8 @@ else
   if [[ "\${USER_COUNT}" == "1" ]]; then
     echo "VM powering off..."
     systemctl poweroff
-    sleep 60
+    # Tell the proxy to wait for the VM to finish shutting down before disconnecting
+    printf '\033]9998\007' > "\$(tty)"
   else
     # disconnect client
     printf '\033]9999\007' > "\$(tty)"

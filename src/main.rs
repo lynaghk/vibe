@@ -408,6 +408,7 @@ fn spawn_console_socket_proxy(hvc_out: OwnedFd, hvc_in: OwnedFd, socket_path: Pa
             let client_fd = stream.as_raw_fd();
             let _stream = stream;
             let mut buf = [0u8; 4096];
+            let mut shutdown_wait: bool = false;
 
             // unsafe {
             //     libc::write(hvc_in_fd, "\n".as_ptr() as *const _, 1);
@@ -463,10 +464,15 @@ fn spawn_console_socket_proxy(hvc_out: OwnedFd, hvc_in: OwnedFd, socket_path: Pa
                     // exits. Close the client socket so attach_console exits via normal
                     // socket-close detection. OSC 9999 won't appear in real terminal output.
                     const SENTINEL: &[u8] = b"\x1b]9999\x07";
+                    const SENTINEL_SHUTDOWN: &[u8] = b"\x1b]9998\x07";
                     const DSR: &[u8] = b"\x1b[6n";
                     let data = &buf[..n as usize];
                     if data.windows(SENTINEL.len()).any(|w| w == SENTINEL) {
                         break 'client;
+                    }
+                    if data.windows(SENTINEL_SHUTDOWN.len()).any(|w| w == SENTINEL_SHUTDOWN) {
+                        // don't push more data to the client once we know that the VM is shutting down
+                        shutdown_wait = true;
                     }
                     // Strip ESC[6n (DSR cursor-position query) — prevents spurious CPR
                     // responses from leaking onto the client terminal.
@@ -480,7 +486,7 @@ fn spawn_console_socket_proxy(hvc_out: OwnedFd, hvc_in: OwnedFd, socket_path: Pa
                             i += 1;
                         }
                     }
-                    if !filtered.is_empty()
+                    if !shutdown_wait && !filtered.is_empty()
                         && unsafe {
                             libc::write(client_fd, filtered.as_ptr() as *const _, filtered.len())
                         } < 0
