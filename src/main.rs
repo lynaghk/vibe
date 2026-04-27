@@ -127,6 +127,7 @@ impl DirectoryShare {
 fn attach_console(
     instance_dir: PathBuf,
     login_actions: Vec<LoginAction>,
+    clear: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // eprintln!("Attaching to console ...");
     // Try each console slot in order; use the first one that isn't already busy.
@@ -209,8 +210,13 @@ fn attach_console(
                 text: "~#".to_string(),
                 timeout: LOGIN_EXPECT_TIMEOUT,
             },
-            Send(" cat /etc/vibe_motd".to_string()),
         ];
+    if clear {
+        all_actions.push(Send(" clear && cat /etc/vibe_motd".to_string()));
+    } else {
+        all_actions.push(Send(" cat /etc/vibe_motd".to_string()));
+    }
+
     all_actions.extend(login_actions);
 
     let mut buf = [0u8; 4096];
@@ -400,7 +406,6 @@ fn spawn_console_socket_proxy(hvc_out: OwnedFd, hvc_in: OwnedFd, socket_path: Pa
             // };
 
             'client: loop {
-                let now = Instant::now();
                 // let poll_timeout_ms: i32 = if now < ignore_client_input_until {
                 //     ignore_client_input_until
                 //         .duration_since(now)
@@ -811,7 +816,7 @@ Options
         match try_acquire_instance_lock(&instance_dir)
             .map_err(|e| format!("Could not open instance lock: {e}"))?
         {
-            None => return attach_console(instance_dir, args.login_actions),
+            None => return attach_console(instance_dir, args.login_actions, args.clear),
             Some(fd) => Some(fd),
             // fd is intentionally leaked here: it must stay open so the daemon
             // inherits it across exec and continues to hold the lock.
@@ -863,7 +868,7 @@ Options
             }
             thread::sleep(Duration::from_millis(200));
         }
-        attach_console(instance_dir, parse_cli()?.login_actions)
+        attach_console(instance_dir, parse_cli()?.login_actions, parse_cli()?.clear)
     } else {
         // We are the daemon process.
         // At this point the VM is provisioned. The VM is now powered off.
@@ -879,6 +884,7 @@ struct CliArgs {
     help: bool,
     daemon: bool,
     attach: bool,
+    clear: bool,
     no_default_mounts: bool,
     mounts: Vec<String>,
     login_actions: Vec<LoginAction>,
@@ -899,6 +905,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
     let mut version = false;
     let mut help = false;
     let mut daemon = false;
+    let mut clear = true;
     let mut attach = false;
     let mut no_default_mounts = false;
     let mut mounts = Vec::new();
@@ -914,6 +921,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
             Long("help") | Short('h') => help = true,
             Long("_daemon") => daemon = true,
             Long("_attach") => attach = true,
+            Long("_no-clear") => clear = false,
             Long("no-default-mounts") => no_default_mounts = true,
             Long("cpus") => {
                 let value = os_to_string(parser.value()?, "--cpus")?.parse()?;
@@ -970,6 +978,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         help,
         daemon,
         attach,
+        clear,
         no_default_mounts,
         mounts,
         login_actions,
