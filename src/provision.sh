@@ -75,6 +75,11 @@ else
 fi
 EOF
 
+for d in hvc0 hvc2 hvc4 hvc6; do
+  mkdir -p /etc/systemd/system/serial-getty@${d}.service.d
+  printf '[Service]\nExecStart=\nExecStart=-/sbin/agetty --noclear --autologin root - linux\n' \
+> /etc/systemd/system/serial-getty@${d}.service.d/autologin.conf;
+done
 
 # Install Rust
 curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --component "rustfmt,clippy"

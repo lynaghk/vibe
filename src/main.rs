@@ -27,6 +27,7 @@ use lexopt::prelude::*;
 use objc2::{AnyThread, rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::*;
 use objc2_virtualization::*;
+use single_instance::SingleInstance;
 
 mod networking;
 use networking::*;
@@ -131,45 +132,30 @@ fn attach_console(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let instance_dir = project_root.join(".vibe");
     // eprintln!("Attaching to console ...");
-    // Try each console slot in order; use the first one that isn't already busy.
-    // The proxy sends "console is already attached\r\n" immediately when busy,
-    // so a 150 ms poll is enough to distinguish busy from available.
-    const BUSY_MSG: &[u8] = b"console is already attached\r\n";
     // hvc0.sock is the main daemon console
     // The others are extra getty sessions (hvc2/4/6)
     const SOCK_NAMES: [&str; 4] = ["hvc0.sock", "hvc2.sock", "hvc4.sock", "hvc6.sock"];
 
     let mut chosen_stream: Option<UnixStream> = None;
     let mut chosen_resize_path: Option<PathBuf> = None;
-    let mut prefetched: Vec<u8> = Vec::new();
+
+    let mut _lck: Option<SingleInstance> = None;
 
     for name in &SOCK_NAMES {
+        let lock_path = instance_dir.join(name.replace(".sock", ".lock"));
+        let lock_path_str = lock_path.to_str().unwrap();
+        let lock = SingleInstance::new(lock_path_str)?;
+        if !lock.is_single() {
+            continue;
+        }
+        _lck = Some(lock);
         let path = instance_dir.join(name);
-        if !path.exists() {
-            continue;
-        }
+        let sock_path = path.to_str().unwrap();
         let Ok(s) = UnixStream::connect(&path) else {
-            continue;
+            return Err(format!("Could not connect to {sock_path}").into());
         };
-        let fd = s.as_raw_fd();
-        let mut check_buf = [0u8; 64];
-        let mut poll_fd = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let got_data = unsafe { libc::poll(&mut poll_fd, 1, 150) } > 0
-            && poll_fd.revents & libc::POLLIN != 0;
-        if got_data {
-            let n =
-                unsafe { libc::read(fd, check_buf.as_mut_ptr() as *mut _, check_buf.len()) };
-            if n > 0 && &check_buf[..n as usize] == BUSY_MSG {
-                continue; // busy — try next slot
-            }
-            if n > 0 {
-                prefetched.extend_from_slice(&check_buf[..n as usize]);
-            }
-        }
+        eprintln!("Connected to {sock_path}");
+
         let resize_name = name.replace(".sock", "-resize.sock");
         chosen_resize_path = Some(instance_dir.join(resize_name));
         chosen_stream = Some(s);
@@ -184,9 +170,9 @@ fn attach_console(
 
     // Send terminal resize events over the matching resize socket.
     let resize_socket_path = chosen_resize_path.ok_or("Resize path not given?")?;
+    let resize_socket_path_str = resize_socket_path.to_string_lossy();
     if !resize_socket_path.exists() {
-        let s = resize_socket_path.to_string_lossy();
-        return Err(format!("Resize socket {s} does not exist").into());
+        return Err(format!("Resize socket {resize_socket_path_str} does not exist").into());
     }
     if let Ok(mut resize_stream) = UnixStream::connect(&resize_socket_path) {
         let _ = thread::spawn(move || {
@@ -200,15 +186,17 @@ fn attach_console(
                 thread::sleep(Duration::from_millis(100));
             }
         });
+    } else {
+        return Err(format!("Could not connect to {resize_socket_path_str}").into());
     }
 
     let mut all_actions: Vec<LoginAction> =
         vec![
-            Expect {
-                text: "login:".to_string(),
-                timeout: LOGIN_EXPECT_TIMEOUT,
-            },
-            Send("root".to_string()),
+            // Expect {
+            //     text: "login:".to_string(),
+            //     timeout: LOGIN_EXPECT_TIMEOUT,
+            // },
+            Send("".to_string()),
             Expect {
                 text: "~#".to_string(),
                 timeout: LOGIN_EXPECT_TIMEOUT,
@@ -231,14 +219,8 @@ fn attach_console(
 
     let mut buf = [0u8; 4096];
     // Seed with any bytes already read during the busy-check poll.
-    let mut output_buf = String::from_utf8_lossy(&prefetched).into_owned();
+    let mut output_buf = String::new();
     let mut raw_guard: Option<RawModeGuard> = None;
-    if !prefetched.is_empty() {
-        raw_guard = enable_raw_mode(libc::STDIN_FILENO).ok();
-        let mut stdout = std::io::stdout().lock();
-        let _ = stdout.write_all(&prefetched);
-        let _ = stdout.flush();
-    }
 
     // Helper: poll both fds, forward stdin→socket, accumulate socket→stdout into output_buf.
     // Returns false if the socket closed.
@@ -304,7 +286,7 @@ fn attach_console(
                     if now >= deadline {
                         return Err(format!("Timeout waiting for '{text}'").into());
                     }
-                    let ms = (deadline - now).as_millis().min(100) as i32;
+                    let ms = (deadline - now).as_millis().min(16) as i32;
                     if !poll_and_forward!(ms) {
                         return Ok(());
                     }
@@ -950,7 +932,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
             Long("help") | Short('h') => help = true,
             Long("_daemon") => daemon = true,
             Long("_attach") => attach = true,
-            Long("_no-clear") => clear = false,
+            Long("no-clear") => clear = false,
             Long("no-default-mounts") => no_default_mounts = true,
             Long("cpus") => {
                 let value = os_to_string(parser.value()?, "--cpus")?.parse()?;
