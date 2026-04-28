@@ -150,11 +150,10 @@ fn attach_console(
         }
         _lck = Some(lock);
         let path = instance_dir.join(name);
-        let sock_path = path.to_str().unwrap();
         let Ok(s) = UnixStream::connect(&path) else {
-            return Err(format!("Could not connect to {sock_path}").into());
+            return Err(format!("Could not connect to {}", path.display()).into());
         };
-        eprintln!("Connected to {sock_path}");
+        eprintln!("Connected to {}", path.display());
 
         let resize_name = name.replace(".sock", "-resize.sock");
         chosen_resize_path = Some(instance_dir.join(resize_name));
@@ -170,9 +169,8 @@ fn attach_console(
 
     // Send terminal resize events over the matching resize socket.
     let resize_socket_path = chosen_resize_path.ok_or("Resize path not given?")?;
-    let resize_socket_path_str = resize_socket_path.to_string_lossy();
     if !resize_socket_path.exists() {
-        return Err(format!("Resize socket {resize_socket_path_str} does not exist").into());
+        return Err(format!("Resize socket {} does not exist", resize_socket_path.display()).into());
     }
     if let Ok(mut resize_stream) = UnixStream::connect(&resize_socket_path) {
         let _ = thread::spawn(move || {
@@ -187,7 +185,7 @@ fn attach_console(
             }
         });
     } else {
-        return Err(format!("Could not connect to {resize_socket_path_str}").into());
+        return Err(format!("Could not connect to {}", resize_socket_path.display()).into());
     }
 
     let mut all_actions: Vec<LoginAction> =
