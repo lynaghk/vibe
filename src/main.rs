@@ -20,7 +20,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-
+use std::process::Child;
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
 use lexopt::prelude::*;
@@ -135,9 +135,9 @@ fn attach_console(
     // The proxy sends "console is already attached\r\n" immediately when busy,
     // so a 150 ms poll is enough to distinguish busy from available.
     const BUSY_MSG: &[u8] = b"console is already attached\r\n";
-    // hvc0.sock is the main daemon console (already logged in — no auto-login needed).
-    // The others are extra getty sessions (hvc2/4/6) that need auto-login.
-    const SOCK_NAMES: [&str; 4] = ["hvc0.sock", "console.sock", "console1.sock", "console2.sock"];
+    // hvc0.sock is the main daemon console
+    // The others are extra getty sessions (hvc2/4/6)
+    const SOCK_NAMES: [&str; 4] = ["hvc0.sock", "hvc2.sock", "hvc4.sock", "hvc6.sock"];
 
     let mut chosen_stream: Option<UnixStream> = None;
     let mut chosen_resize_path: Option<PathBuf> = None;
@@ -183,21 +183,23 @@ fn attach_console(
     let _stream = stream;
 
     // Send terminal resize events over the matching resize socket.
-    let resize_socket_path = chosen_resize_path.unwrap_or_else(|| instance_dir.join("console-resize.sock"));
-    if resize_socket_path.exists() {
-        if let Ok(mut resize_stream) = UnixStream::connect(&resize_socket_path) {
-            let _ = thread::spawn(move || {
-                loop {
-                    if let Some((rows, cols)) = terminal_size(libc::STDOUT_FILENO) {
-                        let msg = format!("{rows} {cols}\n");
-                        if resize_stream.write_all(msg.as_bytes()).is_err() {
-                            break;
-                        }
+    let resize_socket_path = chosen_resize_path.ok_or("Resize path not given?")?;
+    if !resize_socket_path.exists() {
+        let s = resize_socket_path.to_string_lossy();
+        return Err(format!("Resize socket {s} does not exist").into());
+    }
+    if let Ok(mut resize_stream) = UnixStream::connect(&resize_socket_path) {
+        let _ = thread::spawn(move || {
+            loop {
+                if let Some((rows, cols)) = terminal_size(libc::STDOUT_FILENO) {
+                    let msg = format!("{rows} {cols}\n");
+                    if resize_stream.write_all(msg.as_bytes()).is_err() {
+                        break;
                     }
-                    thread::sleep(Duration::from_millis(200));
                 }
-            });
-        }
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
     }
 
     let mut all_actions: Vec<LoginAction> =
@@ -830,7 +832,10 @@ Options
         match try_acquire_instance_lock(&instance_dir)
             .map_err(|e| format!("Could not open instance lock: {e}"))?
         {
-            None => return attach_console(project_root, args.login_actions, args.clear),
+            None => {
+                // eprintln!("VM is running / lock is held...");
+                return attach_console(project_root, args.login_actions, args.clear)
+            },
             Some(fd) => Some(fd),
             // fd is intentionally leaked here: it must stay open so the daemon
             // inherits it across exec and continues to hold the lock.
@@ -865,22 +870,32 @@ Options
         //     .truncate(true)
         //     .open(instance_dir.join("daemon.log"))?;
         // eprintln!("Spawning VM daemon...");
+        let mut child: Option<Child> = None;
         if !parse_cli()?.attach {
-            Command::new(env::current_exe()?)
+            child = Some(Command::new(env::current_exe()?)
                 .arg("--_daemon")
                 .args(env::args_os().skip(1))
                 // .stdin(Stdio::null())
                 // .stdout(log_file.try_clone()?)
                 // .stderr(log_file)
-                .spawn()?;
+                .spawn()?);
         }
 
         let deadline = Instant::now() + Duration::from_secs(300); // 5 minute timeout
         while !hvc0_sock.exists() {
+            if let Some(c) = &mut child {
+                match c.try_wait() {
+                    Ok(Some(status)) => {
+                        return Err(format!("Daemon exited with {status}").into());
+                    }
+                    Ok(None) => { /* still running */ }
+                    Err(e) => { return Err(e.into()); }
+                }
+            }
             if Instant::now() >= deadline {
                 return Err("client: Timed out waiting for VM daemon to finish booting".into());
             }
-            thread::sleep(Duration::from_millis(200));
+            thread::sleep(Duration::from_millis(100));
         }
         attach_console(project_root, parse_cli()?.login_actions, parse_cli()?.clear)
     } else {
@@ -1831,9 +1846,9 @@ fn run_vm(
     println!("VM booting...");
 
     const CONSOLE_SOCK_NAMES: [&str; N_CONSOLE_SLOTS] =
-        ["console.sock", "console1.sock", "console2.sock"];
+        ["hvc2.sock", "hvc4.sock", "hvc6.sock"];
     const RESIZE_SOCK_NAMES: [&str; N_CONSOLE_SLOTS] =
-        ["console-resize.sock", "console1-resize.sock", "console2-resize.sock"];
+        ["hvc2-resize.sock", "hvc4-resize.sock", "hvc6-resize.sock"];
     if let Some(ref base) = console_socket_path {
         for (i, (host_read, host_write, host_resize_write)) in
             host_console_fds.into_iter().enumerate()
@@ -1897,23 +1912,6 @@ fn run_vm(
             "bash_logout.sh",
             BASH_LOGOUT_SCRIPT,
         )?));
-        // Configure and enable all N_CONSOLE_SLOTS getty services in one shot.
-        // all_login_actions.push(Send(
-        //     " for d in hvc0 hvc2 hvc4 hvc6; do \
-        //       mkdir -p /etc/systemd/system/serial-getty@${d}.service.d && \
-        //       printf '[Service]\\nExecStart=\\nExecStart=-/sbin/agetty --nonewline --8bits --noissue --noclear - linux\\n' \
-        //         > /etc/systemd/system/serial-getty@${d}.service.d/autologin.conf; \
-        //       done"
-        //         .to_string(),
-        // ));
-        // all_login_actions.push(Send(
-        //     " systemctl daemon-reload && systemctl enable --now \
-        //       serial-getty@hvc0.service \
-        //       serial-getty@hvc2.service \
-        //       serial-getty@hvc4.service \
-        //       serial-getty@hvc6.service"
-        //         .to_string(),
-        // ));
         // Start getty on hvc2/4/6 so attach_console can connect to them.
         all_login_actions.push(Send(
             " systemctl start serial-getty@hvc2.service serial-getty@hvc4.service serial-getty@hvc6.service"
