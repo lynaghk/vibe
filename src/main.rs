@@ -1965,7 +1965,7 @@ fn run_vm(
                             ];
                             let ret = unsafe { libc::poll(fds.as_mut_ptr(), 1, 2000) };
                             if ret == 0 {
-                                eprintln!("timeout!");
+                                // eprintln!("timeout!");
                             } else if ret == -1 {
                                 eprintln!("Error!");
                                 return;
