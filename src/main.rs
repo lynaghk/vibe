@@ -135,7 +135,7 @@ fn attach_console(
     // eprintln!("Attaching to console ...");
     // hvc0.sock is the main daemon console
     // The others are extra getty sessions (hvc2/4/6)
-    const SOCK_NAMES: [&str; 4] = ["hvc0.sock", "hvc2.sock", "hvc4.sock", "hvc6.sock"];
+    const SOCK_NAMES: [&str; 1] = ["hvc0.sock"];
 
     let mut chosen_stream: Option<UnixStream> = None;
     let mut chosen_resize_path: Option<PathBuf> = None;
@@ -176,12 +176,12 @@ fn attach_console(
     if let Ok(mut resize_stream) = UnixStream::connect(&resize_socket_path) {
         let _ = thread::spawn(move || {
             loop {
-                if let Some((rows, cols)) = terminal_size(libc::STDOUT_FILENO) {
-                    let msg = format!("{rows} {cols}\n");
-                    if resize_stream.write_all(msg.as_bytes()).is_err() {
-                        break;
-                    }
-                }
+                // if let Some((rows, cols)) = terminal_size(libc::STDOUT_FILENO) {
+                //     let msg = format!("{rows} {cols}\n");
+                //     if resize_stream.write_all(msg.as_bytes()).is_err() {
+                //         break;
+                //     }
+                // }
                 thread::sleep(Duration::from_millis(100));
             }
         });
@@ -1453,8 +1453,8 @@ fn create_vm_configuration(
     network_backend: &mut PreparedNetworkBackend,
     vm_reads_from_fd: OwnedFd,
     vm_writes_to_fd: OwnedFd,
-    resize_reads_from_fd: OwnedFd,
-    resize_writes_to_fd: OwnedFd,
+    vm_resize_reads_from_fd: OwnedFd,
+    vm_resize_writes_to_fd: OwnedFd,
     // Each entry adds one hvcN (bidirectional) + one hvcN+1 (resize read-only) serial port.
     extra_consoles: Vec<(OwnedFd, OwnedFd, OwnedFd)>,
     cpu_count: usize,
@@ -1591,12 +1591,12 @@ fn create_vm_configuration(
 
             let resize_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
                 NSFileHandle::alloc(),
-                resize_reads_from_fd.into_raw_fd(),
+                vm_resize_reads_from_fd.into_raw_fd(),
                 true,
             );
             let resize_write_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
                 NSFileHandle::alloc(),
-                resize_writes_to_fd.into_raw_fd(),
+                vm_resize_writes_to_fd.into_raw_fd(),
                 true,
             );
             let resize_attach =
@@ -1608,36 +1608,36 @@ fn create_vm_configuration(
             let resize_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
             resize_port.setAttachment(Some(&resize_attach));
 
-            let mut all_ports = vec![
+            let all_ports = vec![
                 Retained::into_super(serial_port),
                 Retained::into_super(resize_port),
             ];
             for (console_reads, console_writes, console_resize_reads) in extra_consoles {
-                let console_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
-                    NSFileHandle::alloc(),
-                    console_reads.into_raw_fd(),
-                    true,
-                );
-                let console_write_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
-                    NSFileHandle::alloc(),
-                    console_writes.into_raw_fd(),
-                    true,
-                );
-                let console_attach =
-                    VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
-                        VZFileHandleSerialPortAttachment::alloc(),
-                        Some(&console_read_handle),
-                        Some(&console_write_handle),
-                    );
-                let console_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
-                console_port.setAttachment(Some(&console_attach));
+                // let console_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+                //     NSFileHandle::alloc(),
+                //     console_reads.into_raw_fd(),
+                //     true,
+                // );
+                // let console_write_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+                //     NSFileHandle::alloc(),
+                //     console_writes.into_raw_fd(),
+                //     true,
+                // );
+                // let console_attach =
+                //     VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                //         VZFileHandleSerialPortAttachment::alloc(),
+                //         Some(&console_read_handle),
+                //         Some(&console_write_handle),
+                //     );
+                // let console_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
+                // console_port.setAttachment(Some(&console_attach));
 
-                let console_resize_read_handle =
-                    NSFileHandle::initWithFileDescriptor_closeOnDealloc(
-                        NSFileHandle::alloc(),
-                        console_resize_reads.into_raw_fd(),
-                        true,
-                    );
+                // let console_resize_read_handle =
+                //     NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+                //         NSFileHandle::alloc(),
+                //         console_resize_reads.into_raw_fd(),
+                //         true,
+                //     );
                 // let console_resize_attach =
                 //     VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
                 //         VZFileHandleSerialPortAttachment::alloc(),
@@ -1734,7 +1734,7 @@ fn run_vm(
     let (vm_reads_from, we_write_to) = create_pipe(); // hvc0 host->guest
     let (we_read_from, vm_writes_to) = create_pipe(); // hvc0 host<-guest
     let (vm_reads_resize_from, we_write_resize_to) = create_pipe(); // hvc1 host->guest
-    let (we_reads_resize_from, vm_writes_resize_to) = create_pipe(); // hvc1 host<-guest
+    let (host_reads_resize_from, vm_writes_resize_to) = create_pipe(); // hvc1 host<-guest
 
     // hvc2/hvc3, hvc4/hvc5, hvc6/hvc7 — one console+resize pair per attach slot.
     const N_CONSOLE_SLOTS: usize = 3;
@@ -1887,6 +1887,10 @@ fn run_vm(
         )?));
         // Start getty on hvc2/4/6 so attach_console can connect to them.
         // all_login_actions.push(Send(
+        //     " systemctl stop serial-getty@hvc1.service"
+        //         .to_string(),
+        // ));
+        // all_login_actions.push(Send(
         //     " systemctl start serial-getty@hvc2.service serial-getty@hvc4.service serial-getty@hvc6.service"
         //         .to_string(),
         // ));
@@ -1934,42 +1938,6 @@ fn run_vm(
         let hvc0_sock        = console_path.with_file_name("hvc0.sock");
         let hvc0_resize_sock = console_path.with_file_name("hvc0-resize.sock");
 
-        thread::spawn(move || {
-            // poll we_reads_resize_from
-            let mut buf = [0u8; 4096];
-            loop {
-                let mut fds = [
-                    libc::pollfd {
-                        fd: we_reads_resize_from.as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    },
-                ];
-                let ret = unsafe { libc::poll(fds.as_mut_ptr(), 1, 2000) };
-                if ret == 0 {
-                    eprintln!("timeout!");
-                } else if ret == -1 {
-                    eprintln!("Error!");
-                    return;
-                } else if fds[0].revents & libc::POLLIN != 0 { // data from /dev/hvc1?
-                    let n =
-                        unsafe { libc::read(we_reads_resize_from.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
-                    if n <= 0 {
-                        return;
-                    } else {
-                        // eprintln!("received data from client /dev/hvc1: {n}");
-                        let slice = &buf[..n as usize];
-                        eprintln!("received data from client /dev/hvc1 ({n} bytes): {:?}", slice);
-                        // or, if you expect UTF-8 text:
-                        eprintln!("received: {}", String::from_utf8_lossy(slice));
-                    }
-                } else {
-                    // POLLHUP / POLLERR / POLLNVAL — fd is gone
-                    eprintln!("poll: unexpected revents: {:#x}", fds[0].revents);
-                    return;
-                }
-            }
-        });
 
         // Supervisor: waits for login actions, shuts down spawn_vm_io, then
         // hands the recovered hvc0 FDs to a socket proxy.
@@ -1984,6 +1952,42 @@ fn run_vm(
                 }
                 _ => {
                     let (vm_out, vm_in, resize) = io_ctx.shutdown();
+                    thread::spawn(move || {
+                        // poll we_reads_resize_from
+                        let mut buf = [0u8; 4096];
+                        loop {
+                            let mut fds = [
+                                libc::pollfd {
+                                    fd: host_reads_resize_from.as_raw_fd(),
+                                    events: libc::POLLIN,
+                                    revents: 0,
+                                },
+                            ];
+                            let ret = unsafe { libc::poll(fds.as_mut_ptr(), 1, 2000) };
+                            if ret == 0 {
+                                eprintln!("timeout!");
+                            } else if ret == -1 {
+                                eprintln!("Error!");
+                                return;
+                            } else if fds[0].revents & libc::POLLIN != 0 { // data from /dev/hvc1?
+                                let n =
+                                    unsafe { libc::read(host_reads_resize_from.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
+                                if n <= 0 {
+                                    return;
+                                } else {
+                                    // eprintln!("received data from client /dev/hvc1: {n}");
+                                    let slice = &buf[..n as usize];
+                                    eprintln!("received data from client /dev/hvc1 ({n} bytes): {:?}", slice);
+                                    // or, if you expect UTF-8 text:
+                                    // eprintln!("received: {}", String::from_utf8_lossy(slice));
+                                }
+                            } else {
+                                // POLLHUP / POLLERR / POLLNVAL — fd is gone
+                                eprintln!("poll: unexpected revents: {:#x}", fds[0].revents);
+                                return;
+                            }
+                        }
+                    });
                     // Write a single newline to trigger the display of the login prompt
                     // as the original prompt has already been consumed
                     unsafe {
