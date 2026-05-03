@@ -653,8 +653,8 @@ fn run_daemon_vm(args: CliArgs, instance_dir: PathBuf) -> Result<(), Box<dyn std
 
     // if the vibe client attaching aborts _before_ actually logging in,
     // we still want to shutdown the VM:
-    const S: &str = " bash -c '(while true; do sleep 3; if [[ \"$(who | wc -l | tr -d \" \")\" == \"0\" ]]; then echo \"VM powering off...\"; systemctl poweroff; fi; done) 2>&1 &'";
-    login_actions.push(Send(S.to_string()));
+    // const S: &str = " bash -c '(while true; do sleep 3; if [[ \"$(who | wc -l | tr -d \" \")\" == \"0\" ]]; then echo \"VM powering off...\"; systemctl poweroff; fi; done) 2>&1 &'";
+    // login_actions.push(Send(S.to_string()));
 
     // temporarily disable automatic poweroff when logging out
     login_actions.push(Send(" export VIBE_POWEROFF=false".to_string()));
