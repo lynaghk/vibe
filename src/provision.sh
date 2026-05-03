@@ -14,7 +14,8 @@ apt-get install -y --no-install-recommends      \
         libssl-dev                              \
         curl                                    \
         git                                     \
-        ripgrep
+        ripgrep                                 \
+        sysstat
 
 # Expand disk partition
 growpart /dev/vda 1

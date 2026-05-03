@@ -21,6 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 use std::process::Child;
+use std::sync::atomic::{AtomicI32, Ordering};
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
 use lexopt::prelude::*;
@@ -190,10 +191,6 @@ fn attach_console(
 
     let mut all_actions: Vec<LoginAction> =
         vec![
-            // Expect {
-            //     text: "login:".to_string(),
-            //     timeout: LOGIN_EXPECT_TIMEOUT,
-            // },
             Send("".to_string()),
             Expect {
                 text: "~#".to_string(),
@@ -207,11 +204,11 @@ fn attach_console(
         .into_owned();
     all_actions.push(Send(format!(" cd {abspath}")));
 
-    if clear {
-        all_actions.push(Send(" clear && cat /etc/vibe_motd".to_string()));
-    } else {
-        all_actions.push(Send(" cat /etc/vibe_motd".to_string()));
-    }
+    // if clear {
+    //     all_actions.push(Send(" clear && cat /etc/vibe_motd".to_string()));
+    // } else {
+    //     all_actions.push(Send(" cat /etc/vibe_motd".to_string()));
+    // }
 
     all_actions.extend(login_actions);
 
@@ -284,8 +281,7 @@ fn attach_console(
                     if now >= deadline {
                         return Err(format!("Timeout waiting for '{text}'").into());
                     }
-                    let ms = (deadline - now).as_millis().min(16) as i32;
-                    if !poll_and_forward!(ms) {
+                    if !poll_and_forward!(1000) {
                         return Ok(());
                     }
                 }
@@ -359,7 +355,7 @@ fn attach_console(
     Ok(())
 }
 
-fn spawn_console_socket_proxy(hvc_out: OwnedFd, hvc_in: OwnedFd, socket_path: PathBuf) {
+fn spawn_console_socket_proxy(connected_clients: Arc<AtomicI32>, hvc_out: OwnedFd, hvc_in: OwnedFd, socket_path: PathBuf) {
     // Bind synchronously so the socket file exists as soon as this function returns.
     let _ = fs::remove_file(&socket_path);
     let listener = match UnixListener::bind(&socket_path) {
@@ -374,7 +370,6 @@ fn spawn_console_socket_proxy(hvc_out: OwnedFd, hvc_in: OwnedFd, socket_path: Pa
         let hvc_in_fd = hvc_in.as_raw_fd();
         let _hvc_out = hvc_out;
         let _hvc_in = hvc_in;
-        let listener_fd = listener.as_raw_fd();
 
         loop {
             // Blocking accept: wait for the next client.
@@ -383,29 +378,14 @@ fn spawn_console_socket_proxy(hvc_out: OwnedFd, hvc_in: OwnedFd, socket_path: Pa
                 Err(_) => break,
             };
 
-            // While serving this client, switch to non-blocking accept so new connections
-            // can be rejected immediately rather than queuing silently.
-            let _ = listener.set_nonblocking(true);
+            connected_clients.fetch_add(1, Ordering::SeqCst);
 
             let client_fd = stream.as_raw_fd();
             let _stream = stream;
             let mut buf = [0u8; 4096];
             let mut shutdown_wait: bool = false;
 
-            // unsafe {
-            //     libc::write(hvc_in_fd, "\n".as_ptr() as *const _, 1);
-            // };
-
             'client: loop {
-                // let poll_timeout_ms: i32 = if now < ignore_client_input_until {
-                //     ignore_client_input_until
-                //         .duration_since(now)
-                //         .as_millis()
-                //         .min(300) as i32
-                // } else {
-                //     -1
-                // };
-
                 let mut fds = [
                     libc::pollfd {
                         fd: hvc_out_fd,
@@ -417,25 +397,17 @@ fn spawn_console_socket_proxy(hvc_out: OwnedFd, hvc_in: OwnedFd, socket_path: Pa
                         events: libc::POLLIN,
                         revents: 0,
                     },
-                    libc::pollfd {
-                        fd: listener_fd,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    },
                 ];
 
-                let ret = unsafe { libc::poll(fds.as_mut_ptr(), 3, -1) };
+                let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
                 if ret < 0 {
+                    // client disconnected
+                    let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
+                    eprintln!("number of connected clients: {new_val}");
                     break 'client;
                 }
 
-                // New connection while busy: drain the accept queue and reject each one.
-                if fds[2].revents & libc::POLLIN != 0 {
-                    while let Ok((mut new_stream, _)) = listener.accept() {
-                        let _ = new_stream.write_all(b"console is already attached\r\n");
-                    }
-                }
-
+                // data from /dev/hvcN
                 if fds[0].revents & libc::POLLIN != 0 {
                     let n =
                         unsafe { libc::read(hvc_out_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
@@ -447,32 +419,39 @@ fn spawn_console_socket_proxy(hvc_out: OwnedFd, hvc_in: OwnedFd, socket_path: Pa
                     // socket-close detection. OSC 9999 won't appear in real terminal output.
                     const SENTINEL: &[u8] = b"\x1b]9999\x07";
                     const SENTINEL_SHUTDOWN: &[u8] = b"\x1b]9998\x07";
-                    const DSR: &[u8] = b"\x1b[6n";
+                    // const DSR: &[u8] = b"\x1b[6n";
                     let data = &buf[..n as usize];
                     if data.windows(SENTINEL.len()).any(|w| w == SENTINEL) {
+                        // means disconnect
+                        let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
+                        eprintln!("number of connected clients: {new_val}");
                         break 'client;
                     }
                     if data.windows(SENTINEL_SHUTDOWN.len()).any(|w| w == SENTINEL_SHUTDOWN) {
                         // don't push more data to the client once we know that the VM is shutting down
                         shutdown_wait = true;
+                        let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
+                        eprintln!("number of connected clients: {new_val}");
                     }
                     // Strip ESC[6n (DSR cursor-position query) — prevents spurious CPR
                     // responses from leaking onto the client terminal.
                     let mut filtered = Vec::with_capacity(data.len());
                     let mut i = 0;
                     while i < data.len() {
-                        if data[i..].starts_with(DSR) {
-                            i += DSR.len();
-                        } else {
-                            filtered.push(data[i]);
-                            i += 1;
-                        }
+                        // if data[i..].starts_with(DSR) {
+                        //     i += DSR.len();
+                        // } else {
+                        filtered.push(data[i]);
+                        i += 1;
+                        // }
                     }
                     if !shutdown_wait && !filtered.is_empty()
                         && unsafe {
                             libc::write(client_fd, filtered.as_ptr() as *const _, filtered.len())
                         } < 0
                     {
+                        let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
+                        eprintln!("number of connected clients: {new_val}");
                         break 'client; // client disconnected
                     }
                 }
@@ -480,26 +459,30 @@ fn spawn_console_socket_proxy(hvc_out: OwnedFd, hvc_in: OwnedFd, socket_path: Pa
                 if fds[1].revents & libc::POLLIN != 0 {
                     let n = unsafe { libc::read(client_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
                     if n <= 0 {
+                        let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
                         break 'client; // client disconnected
                     }
                     if unsafe {
                         libc::write(hvc_in_fd, buf.as_ptr() as *const _, n as usize)
                     } < 0
                     {
+                        let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
+                        eprintln!("number of connected clients: {new_val}");
                         return; // VM console gone
                     }
                 }
 
                 if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                    let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
+                    eprintln!("number of connected clients: {new_val}");
                     return;
                 }
                 if fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                    let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
+                    eprintln!("number of connected clients: {new_val}");
                     break 'client;
                 }
             }
-
-            // Restore blocking mode so the next accept() at the top of the loop blocks.
-            let _ = listener.set_nonblocking(false);
         }
     });
 }
@@ -1471,6 +1454,7 @@ fn create_vm_configuration(
     vm_reads_from_fd: OwnedFd,
     vm_writes_to_fd: OwnedFd,
     resize_reads_from_fd: OwnedFd,
+    resize_writes_to_fd: OwnedFd,
     // Each entry adds one hvcN (bidirectional) + one hvcN+1 (resize read-only) serial port.
     extra_consoles: Vec<(OwnedFd, OwnedFd, OwnedFd)>,
     cpu_count: usize,
@@ -1610,11 +1594,16 @@ fn create_vm_configuration(
                 resize_reads_from_fd.into_raw_fd(),
                 true,
             );
+            let resize_write_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+                NSFileHandle::alloc(),
+                resize_writes_to_fd.into_raw_fd(),
+                true,
+            );
             let resize_attach =
                 VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
                     VZFileHandleSerialPortAttachment::alloc(),
                     Some(&resize_read_handle),
-                    None,
+                    Some(&resize_write_handle),
                 );
             let resize_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
             resize_port.setAttachment(Some(&resize_attach));
@@ -1742,9 +1731,10 @@ fn run_vm(
     ram_bytes: u64,
     console_socket_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (vm_reads_from, we_write_to) = create_pipe();
-    let (we_read_from, vm_writes_to) = create_pipe();
-    let (resize_reads_from, we_write_resize_to) = create_pipe();
+    let (vm_reads_from, we_write_to) = create_pipe(); // hvc0 host->guest
+    let (we_read_from, vm_writes_to) = create_pipe(); // hvc0 host<-guest
+    let (vm_reads_resize_from, we_write_resize_to) = create_pipe(); // hvc1 host->guest
+    let (we_reads_resize_from, vm_writes_resize_to) = create_pipe(); // hvc1 guest->host
 
     // hvc2/hvc3, hvc4/hvc5, hvc6/hvc7 — one console+resize pair per attach slot.
     const N_CONSOLE_SLOTS: usize = 3;
@@ -1772,7 +1762,8 @@ fn run_vm(
         &mut prepared_network_backend,
         vm_reads_from,
         vm_writes_to,
-        resize_reads_from,
+        vm_reads_resize_from,
+        vm_writes_resize_to,
         vm_extra_consoles,
         cpu_count,
         ram_bytes,
@@ -1824,7 +1815,7 @@ fn run_vm(
     }
 
     println!("VM booting...");
-
+    let connect_clients = Arc::new(AtomicI32::new(0));
     const CONSOLE_SOCK_NAMES: [&str; N_CONSOLE_SLOTS] =
         ["hvc2.sock", "hvc4.sock", "hvc6.sock"];
     const RESIZE_SOCK_NAMES: [&str; N_CONSOLE_SLOTS] =
@@ -1833,7 +1824,9 @@ fn run_vm(
         for (i, (host_read, host_write, host_resize_write)) in
             host_console_fds.into_iter().enumerate()
         {
+            // let host_resize_read = vm_extra_consoles[i].2;
             spawn_console_socket_proxy(
+                Arc::clone(&connect_clients),
                 host_read,
                 host_write,
                 base.with_file_name(CONSOLE_SOCK_NAMES[i]),
@@ -1941,6 +1934,35 @@ fn run_vm(
         let hvc0_sock        = console_path.with_file_name("hvc0.sock");
         let hvc0_resize_sock = console_path.with_file_name("hvc0-resize.sock");
 
+        thread::spawn(move || {
+            // poll we_reads_resize_from
+            let mut buf = [0u8; 1];
+            loop {
+                let mut fds = [
+                    libc::pollfd {
+                        fd: we_reads_resize_from.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                let ret = unsafe { libc::poll(fds.as_mut_ptr(), 1, -1) };
+                if ret < 0 {
+                    return
+                }
+
+                // data from /dev/hvc1
+                if fds[0].revents & libc::POLLIN != 0 {
+                    let n =
+                        unsafe { libc::read(we_reads_resize_from.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
+                    if n <= 0 {
+                        return;
+                    } else {
+                        eprintln!("client disconnected! {n}");
+                    }
+                }
+            }
+        });
+
         // Supervisor: waits for login actions, shuts down spawn_vm_io, then
         // hands the recovered hvc0 FDs to a socket proxy.
         thread::spawn(move || {
@@ -1959,7 +1981,7 @@ fn run_vm(
                     unsafe {
                          libc::write(vm_in.as_raw_fd(), "\n".as_ptr() as *const _, 1);
                     };
-                    spawn_console_socket_proxy(vm_out, vm_in, hvc0_sock);
+                    spawn_console_socket_proxy(Arc::clone(&connect_clients), vm_out, vm_in, hvc0_sock);
                     spawn_console_resize_proxy(resize, hvc0_resize_sock);
                     let _ = done_tx.send(Ok(()));
                 }
