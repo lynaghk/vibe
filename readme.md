@@ -21,6 +21,7 @@ Host                                      Guest                    Mode
 /Users/dev/.codex                         /root/.codex             read-write
 /Users/dev/.claude                        /root/.claude            read-write
 /Users/dev/.gemini                        /root/.gemini            read-write
+/Users/dev/.pi                            /root/.pi                read-write
 
 root@vibe:~/my-project#
 ```
@@ -112,6 +113,7 @@ Invoking vibe without a disk image:
 - shares the `~/.codex` directory with the VM, so you can use OpenAI's [codex](https://openai.com/codex/)
 - shares the `~/.claude` directory with the VM, so you can use Anthropic's [claude](https://claude.com/product/claude-code)
 - shares the `~/.gemini` directory with the VM, so you can use Google's [gemini-cli](https://github.com/google-gemini/gemini-cli)
+- shares the `~/.pi` directory with the VM, so you can use the [Pi agent harness](https://pi.dev/)
 
 The first time you run `vibe`, a Debian Linux image is downloaded to `~/.cache/vibe/`, configured with basic tools like gcc, [mise-en-place](https://mise.jdx.dev/), ripgrep, rust, etc., and saved as `default.raw`.
 (See [provision.sh](/src/provision.sh) for details.)
