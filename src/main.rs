@@ -251,6 +251,7 @@ Options
             DirectoryShare::new(home.join(".codex"), "/root/.codex".into(), false),
             DirectoryShare::new(home.join(".claude"), "/root/.claude".into(), false),
             DirectoryShare::new(home.join(".gemini"), "/root/.gemini".into(), false),
+            DirectoryShare::new(home.join(".pi"), "/root/.pi".into(), false),
         ]
         .into_iter()
         .flatten()

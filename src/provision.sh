@@ -81,6 +81,7 @@ cat > .config/mise/config.toml <<MISE
     "npm:@openai/codex" = "latest"
     "npm:@anthropic-ai/claude-code" = "latest"
     "npm:@google/gemini-cli" = "latest"
+    "npm:@mariozechner/pi-coding-agent" = "latest"
 MISE
 
 touch .config/mise/mise.lock
