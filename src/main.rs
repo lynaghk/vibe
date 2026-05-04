@@ -176,12 +176,12 @@ fn attach_console(
     if let Ok(mut resize_stream) = UnixStream::connect(&resize_socket_path) {
         let _ = thread::spawn(move || {
             loop {
-                // if let Some((rows, cols)) = terminal_size(libc::STDOUT_FILENO) {
-                //     let msg = format!("{rows} {cols}\n");
-                //     if resize_stream.write_all(msg.as_bytes()).is_err() {
-                //         break;
-                //     }
-                // }
+                if let Some((rows, cols)) = terminal_size(libc::STDOUT_FILENO) {
+                    let msg = format!("{rows} {cols}\n");
+                    if resize_stream.write_all(msg.as_bytes()).is_err() {
+                        break;
+                    }
+                }
                 thread::sleep(Duration::from_millis(100));
             }
         });
@@ -1296,7 +1296,7 @@ pub fn spawn_vm_io(
     output_monitor: Arc<OutputMonitor>,
     vm_output_fd: OwnedFd,
     vm_input_fd: OwnedFd,
-    resize_control_fd: OwnedFd,
+    host_write_resize_fd: OwnedFd,
 ) -> IoContext {
     let (input_tx, input_rx): (Sender<VmInput>, Receiver<VmInput>) = mpsc::channel();
 
@@ -1386,7 +1386,7 @@ pub fn spawn_vm_io(
     let resize_thread = thread::spawn({
         let wakeup_read = wakeup_read.try_clone().unwrap();
         move || -> OwnedFd {
-            let mut writer = std::fs::File::from(resize_control_fd);
+            let mut writer = std::fs::File::from(host_write_resize_fd);
             let resize_fd = writer.as_raw_fd();
             let flags = unsafe { libc::fcntl(resize_fd, libc::F_GETFL) };
             if flags >= 0 {
@@ -1731,9 +1731,9 @@ fn run_vm(
     ram_bytes: u64,
     console_socket_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (vm_reads_from, we_write_to) = create_pipe(); // hvc0 host->guest
+    let (vm_reads_from, host_writes_to) = create_pipe(); // hvc0 host->guest
     let (we_read_from, vm_writes_to) = create_pipe(); // hvc0 host<-guest
-    let (vm_reads_resize_from, we_write_resize_to) = create_pipe(); // hvc1 host->guest
+    let (vm_reads_resize_from, host_write_resize_to) = create_pipe(); // hvc1 host->guest
     let (host_reads_resize_from, vm_writes_resize_to) = create_pipe(); // hvc1 host<-guest
 
     // hvc2/hvc3, hvc4/hvc5, hvc6/hvc7 — one console+resize pair per attach slot.
@@ -1831,10 +1831,10 @@ fn run_vm(
                 host_write,
                 base.with_file_name(CONSOLE_SOCK_NAMES[i]),
             );
-            spawn_console_resize_proxy(
-                host_resize_write,
-                base.with_file_name(RESIZE_SOCK_NAMES[i]),
-            );
+            // spawn_console_resize_proxy(
+            //     host_resize_write,
+            //     base.with_file_name(RESIZE_SOCK_NAMES[i]),
+            // );
         }
     }
 
@@ -1854,13 +1854,14 @@ fn run_vm(
         // Our terminal is connected via /dev/hvc0 which Debian apparently keeps barebones.
         // We want sane terminal defaults like icrnl (translating carriage returns into newlines)
         Send(" stty -F /dev/hvc0 sane".to_string()),
+        // Send(" stty -F /dev/hvc1 -echo".to_string()),
         // Send(" stty -F /dev/hvc2 sane".to_string()),
         // Send(" stty -F /dev/hvc4 sane".to_string()),
         // Send(" stty -F /dev/hvc6 sane".to_string()),
         // In background, continuously read host terminal resizes sent over hvc1 and update hvc0.
         Send({
             // sorry for this nonsense, the string is so long it angers rustfmt =(
-            const S: &str = " sh -c '(while IFS=\" \" read -r rows cols; do stty -F /dev/hvc0 rows \"$rows\" cols \"$cols\"; done) < /dev/hvc1 >/dev/null 2>&1 &'";
+            const S: &str = " sh -c '(while IFS=\" \" read -s -r rows cols; do stty -F /dev/hvc0 rows \"$rows\" cols \"$cols\"; done) < /dev/hvc1 >/dev/null 2>&1 &'";
             S.to_string()
         }),
     ];
@@ -1920,8 +1921,8 @@ fn run_vm(
         let io_ctx = spawn_vm_io(
             output_monitor.clone(),
             we_read_from,
-            we_write_to,
-            we_write_resize_to,
+            host_writes_to,
+            host_write_resize_to,
         );
 
         let (vm_output_tx, vm_output_rx) = mpsc::channel::<VmOutput>();
@@ -2050,8 +2051,8 @@ fn run_vm(
         let io_ctx = spawn_vm_io(
             output_monitor.clone(),
             we_read_from,
-            we_write_to,
-            we_write_resize_to,
+            host_writes_to,
+            host_write_resize_to,
         );
 
         let (vm_output_tx, vm_output_rx) = mpsc::channel::<VmOutput>();
