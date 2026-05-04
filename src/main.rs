@@ -174,6 +174,7 @@ fn attach_console(
         return Err(format!("Resize socket {} does not exist", resize_socket_path.display()).into());
     }
     if let Ok(mut resize_stream) = UnixStream::connect(&resize_socket_path) {
+        eprintln!("Connected to resize {}", resize_socket_path.display());
         let _ = thread::spawn(move || {
             loop {
                 if let Some((rows, cols)) = terminal_size(libc::STDOUT_FILENO) {
@@ -186,7 +187,7 @@ fn attach_console(
             }
         });
     } else {
-        return Err(format!("Could not connect to {}", resize_socket_path.display()).into());
+        return Err(format!("Could not connect to resize socket {}", resize_socket_path.display()).into());
     }
 
     let mut all_actions: Vec<LoginAction> =
@@ -252,6 +253,7 @@ fn attach_console(
                         libc::read(stream_fd, buf.as_mut_ptr() as *mut _, buf.len())
                     };
                     if n <= 0 {
+                        eprintln!("poll and forward exiting!");
                         return Ok(());
                     }
                     let data = &buf[..n as usize];
@@ -269,8 +271,10 @@ fn attach_console(
     }
 
     for action in all_actions {
+        eprintln!("login action ...");
         match action {
             Expect { text, timeout } => {
+                eprintln!("login action expect ...");
                 let deadline = Instant::now() + timeout;
                 loop {
                     if let Some((_, rest)) = output_buf.split_once(text.as_str()) {
@@ -279,11 +283,10 @@ fn attach_console(
                     }
                     let now = Instant::now();
                     if now >= deadline {
+                        eprintln!("login action expect ... Timeout!");
                         return Err(format!("Timeout waiting for '{text}'").into());
                     }
-                    if !poll_and_forward!(1000) {
-                        return Ok(());
-                    }
+                    poll_and_forward!(1);
                 }
             }
             Send(text) => {
@@ -300,6 +303,8 @@ fn attach_console(
         }
     }
 
+    eprintln!("login actions done");
+
     // Interactive loop: bidirectional proxy using poll_with_wakeup in two threads.
     let (wakeup_read, wakeup_write) = create_pipe();
     let raw_guard = Arc::new(Mutex::new(raw_guard));
@@ -308,7 +313,7 @@ fn attach_console(
         let wakeup_read = wakeup_read.try_clone().unwrap();
         let raw_guard = raw_guard.clone();
         move || {
-            let mut buf = [1u8; 4096];
+            let mut buf = [0u8; 4096];
             loop {
                 match poll_with_wakeup(libc::STDIN_FILENO, wakeup_read.as_raw_fd(), &mut buf) {
                     PollResult::Shutdown | PollResult::Error => break,
@@ -331,7 +336,14 @@ fn attach_console(
             let mut buf = [0u8; 4096];
             loop {
                 match poll_with_wakeup(stream_fd, wakeup_read.as_raw_fd(), &mut buf) {
-                    PollResult::Shutdown | PollResult::Error => break,
+                    PollResult::Shutdown => {
+                        eprintln!("attach_console socket thread: PollResult::Shutdown");
+                        break;
+                    }
+                    PollResult::Error => {
+                        eprintln!("attach_console socket thread: PollResult::Error");
+                        break;
+                    }
                     PollResult::Spurious => continue,
                     PollResult::Ready(bytes) => {
                         {
@@ -348,7 +360,9 @@ fn attach_console(
         }
     });
 
+    eprintln!("joining socket thread...!");
     socket_thread.join().ok();
+    eprintln!("socket_thread exited!");
     unsafe { libc::write(wakeup_write.as_raw_fd(), [0u8].as_ptr() as *const _, 1) };
     stdin_thread.join().ok();
 
@@ -389,7 +403,7 @@ fn spawn_console_socket_proxy(connected_clients: Arc<AtomicI32>,
             let _stream = stream;
             let mut buf = [0u8; 4096];
             let mut shutdown_wait: bool = false;
-            let disconnect_read_fd = disconnect_read.as_raw_fd();
+            // let disconnect_read_fd = disconnect_read.as_raw_fd();
 
             'client: loop {
                 let mut fds = [
@@ -403,14 +417,14 @@ fn spawn_console_socket_proxy(connected_clients: Arc<AtomicI32>,
                         events: libc::POLLIN,
                         revents: 0,
                     },
-                    libc::pollfd {
-                        fd: disconnect_read_fd,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    },
+                    // libc::pollfd {
+                    //     fd: disconnect_read_fd,
+                    //     events: libc::POLLIN,
+                    //     revents: 0,
+                    // },
                 ];
 
-                let ret = unsafe { libc::poll(fds.as_mut_ptr(), 3, -1) };
+                let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
                 if ret < 0 {
                     // client disconnected
                     let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
@@ -423,6 +437,7 @@ fn spawn_console_socket_proxy(connected_clients: Arc<AtomicI32>,
                     let n =
                         unsafe { libc::read(hvc_out_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
                     if n <= 0 {
+                        eprintln!("vm console gone");
                         return; // VM console gone
                     }
                     // Session-end sentinel written by the guest wrapper script after login
@@ -471,32 +486,33 @@ fn spawn_console_socket_proxy(connected_clients: Arc<AtomicI32>,
                     }
                 }
 
-                if fds[2].revents & libc::POLLIN != 0 {
-                    let n = unsafe { libc::read(disconnect_read_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
-                    if n <= 0 {
-                        let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
-                        break 'client;
-                    } else {
-                        let old_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
-                        if old_val == 1 {
-                            let msg = "VM shutting down...";
-                            unsafe { libc::write(client_fd, msg.as_ptr() as *const _, msg.len()) };
-                            let _ = done_tx.send(Ok(()));
-                        }
-                        break 'client;
-                    }
-                }
+                // if fds[2].revents & libc::POLLIN != 0 {
+                //     let n = unsafe { libc::read(disconnect_read_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+                //     if n <= 0 {
+                //         let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
+                //         break 'client;
+                //     } else {
+                //         let old_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
+                //         if old_val == 1 {
+                //             let msg = "VM shutting down...";
+                //             eprintln!("VM shutting down");
+                //             unsafe { libc::write(client_fd, msg.as_ptr() as *const _, msg.len()) };
+                //             let _ = done_tx.send(Ok(()));
+                //         }
+                //         break 'client;
+                //     }
+                // }
 
-                if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-                    let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
-                    eprintln!("number of connected clients: {new_val}");
-                    return;
-                }
-                if fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-                    let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
-                    eprintln!("number of connected clients: {new_val}");
-                    break 'client;
-                }
+                // if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                //     let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
+                //     eprintln!("number of connected clients: {new_val}");
+                //     return;
+                // }
+                // if fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                //     let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
+                //     eprintln!("number of connected clients: {new_val}");
+                //     break 'client;
+                // }
             }
         }
     });
@@ -1623,47 +1639,47 @@ fn create_vm_configuration(
             let resize_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
             resize_port.setAttachment(Some(&resize_attach));
 
-            let all_ports = vec![
+            let mut all_ports = vec![
                 Retained::into_super(serial_port),
                 Retained::into_super(resize_port),
             ];
             for (console_reads, console_writes, console_resize_reads) in extra_consoles {
-                // let console_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
-                //     NSFileHandle::alloc(),
-                //     console_reads.into_raw_fd(),
-                //     true,
-                // );
-                // let console_write_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
-                //     NSFileHandle::alloc(),
-                //     console_writes.into_raw_fd(),
-                //     true,
-                // );
-                // let console_attach =
-                //     VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
-                //         VZFileHandleSerialPortAttachment::alloc(),
-                //         Some(&console_read_handle),
-                //         Some(&console_write_handle),
-                //     );
-                // let console_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
-                // console_port.setAttachment(Some(&console_attach));
-
-                // let console_resize_read_handle =
-                //     NSFileHandle::initWithFileDescriptor_closeOnDealloc(
-                //         NSFileHandle::alloc(),
-                //         console_resize_reads.into_raw_fd(),
-                //         true,
-                //     );
-                // let console_resize_attach =
-                //     VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
-                //         VZFileHandleSerialPortAttachment::alloc(),
-                //         Some(&console_resize_read_handle),
-                //         None,
-                //     );
-                // let console_resize_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
-                // console_resize_port.setAttachment(Some(&console_resize_attach));
-
-                // all_ports.push(Retained::into_super(console_port));
-                // all_ports.push(Retained::into_super(console_resize_port));
+                let console_read_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+                    NSFileHandle::alloc(),
+                    console_reads.into_raw_fd(),
+                    true,
+                );
+                let console_write_handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+                    NSFileHandle::alloc(),
+                    console_writes.into_raw_fd(),
+                    true,
+                );
+                let console_attach =
+                    VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                        VZFileHandleSerialPortAttachment::alloc(),
+                        Some(&console_read_handle),
+                        Some(&console_write_handle),
+                    );
+                let console_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
+                console_port.setAttachment(Some(&console_attach));
+                //
+                let console_resize_read_handle =
+                    NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+                        NSFileHandle::alloc(),
+                        console_resize_reads.into_raw_fd(),
+                        true,
+                    );
+                let console_resize_attach =
+                    VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                        VZFileHandleSerialPortAttachment::alloc(),
+                        Some(&console_resize_read_handle),
+                        None,
+                    );
+                let console_resize_port = VZVirtioConsoleDeviceSerialPortConfiguration::new();
+                console_resize_port.setAttachment(Some(&console_resize_attach));
+                //
+                all_ports.push(Retained::into_super(console_port));
+                all_ports.push(Retained::into_super(console_resize_port));
             }
             let serial_ports: Retained<NSArray<_>> =
                 NSArray::from_retained_slice(all_ports.as_slice());
@@ -1764,7 +1780,7 @@ fn run_vm(
                     let (disconnect_read, disconnect_write) = create_pipe();
                     (
                         (reads_from, writes_to, resize_reads_from),
-                        (we_read, we_write, host_write_resize),
+                        (we_read, we_write, host_write_resize, disconnect_read, disconnect_write),
                     )
                 })
                 .unzip()
@@ -1837,22 +1853,6 @@ fn run_vm(
         ["hvc2.sock", "hvc4.sock", "hvc6.sock"];
     const RESIZE_SOCK_NAMES: [&str; N_CONSOLE_SLOTS] =
         ["hvc2-resize.sock", "hvc4-resize.sock", "hvc6-resize.sock"];
-    if let Some(ref base) = console_socket_path {
-        for (i, (host_read, host_write, host_resize_write)) in
-            host_console_fds.into_iter().enumerate()
-        {
-            // spawn_console_socket_proxy(
-            //     Arc::clone(&connect_clients),
-            //     host_read,
-            //     host_write,
-            //     base.with_file_name(CONSOLE_SOCK_NAMES[i]),
-            // );
-            spawn_console_resize_proxy(
-                host_resize_write,
-                base.with_file_name(RESIZE_SOCK_NAMES[i]),
-            );
-        }
-    }
 
     let mut all_login_actions = vec![
         Expect {
@@ -1950,6 +1950,23 @@ fn run_vm(
         let hvc0_sock        = console_path.with_file_name("hvc0.sock");
         let hvc0_resize_sock = console_path.with_file_name("hvc0-resize.sock");
 
+        for (i, (host_read, host_write, host_resize_write, disconnect_read, disconnect_write)) in
+            host_console_fds.into_iter().enumerate()
+        {
+            eprintln!("spawning");
+            spawn_console_socket_proxy(
+                Arc::clone(&connect_clients),
+                host_read,
+                host_write,
+                disconnect_read,
+                done_tx.clone(),
+                console_path.with_file_name(CONSOLE_SOCK_NAMES[i]),
+            );
+            spawn_console_resize_proxy(
+                host_resize_write,
+                console_path.with_file_name(RESIZE_SOCK_NAMES[i]),
+            );
+        }
 
         // Supervisor: waits for login actions, shuts down spawn_vm_io, then
         // hands the recovered hvc0 FDs to a socket proxy.
