@@ -49,15 +49,9 @@ const BASH_LOGOUT_SCRIPT: &str = include_str!("bash_logout.sh");
 
 #[derive(Clone)]
 enum LoginAction {
-    Expect {
-        text: String,
-        timeout: Duration,
-    },
+    Expect { text: String, timeout: Duration, },
     Send(String),
-    Script {
-        path: PathBuf,
-        index: usize,
-    },
+    Script { path: PathBuf, index: usize, },
 }
 use LoginAction::*;
 
@@ -713,8 +707,6 @@ fn main_daemon(args: CliArgs, instance_dir: PathBuf) -> Result<(), Box<dyn std::
         login_actions.push(motd_action);
     }
 
-    // TODO: if the vibe client attaching aborts _before_ actually logging in,
-    // we want to shutdown the VM.
 
     login_actions.push(Send(" ".to_string())); // newline
     login_actions.push(Expect {
@@ -896,6 +888,7 @@ Options
         }
 
         let deadline = Instant::now() + Duration::from_secs(300); // 5 minute timeout
+        // TODO don't spin?
         while !hvc0_sock.exists() {
             if let Some(c) = &mut child {
                 match c.try_wait() {
@@ -1990,6 +1983,10 @@ fn run_vm_daemon(
             }
             _ => {
                 let (vm_out, vm_in, resize) = io_ctx.shutdown();
+
+                // TODO: if the vibe client attaching aborts _before_ actually logging in,
+                // we want to shutdown the VM.
+
                 // Write a single newline to trigger the display of the login prompt
                 // as the original prompt has already been consumed
                 // unsafe { libc::write(vm_in.as_raw_fd(), "\n".as_ptr() as *const _, 1); }; // newline
