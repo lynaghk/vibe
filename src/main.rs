@@ -662,11 +662,8 @@ fn run_daemon_vm(args: CliArgs, instance_dir: PathBuf) -> Result<(), Box<dyn std
         login_actions.push(motd_action);
     }
 
-    // TODO:
-    // if the vibe client attaching aborts _before_ actually logging in,
-    // we still want to shutdown the VM:
-    // const S: &str = " bash -c '(while true; do sleep 3; if [[ \"$(who | wc -l | tr -d \" \")\" == \"0\" ]]; then echo \"VM powering off...\"; systemctl poweroff; fi; done) 2>&1 &'";
-    // login_actions.push(Send(S.to_string()));
+    // TODO: if the vibe client attaching aborts _before_ actually logging in,
+    // we want to shutdown the VM.
 
     login_actions.push(Send(" ".to_string())); // newline
     login_actions.push(Expect {
@@ -820,7 +817,7 @@ Options
         if !args.attach {
             // Sanity check that no VM is running:
             if hvc0_sock.exists() {
-                return Err("hvc0.sock exists".into());
+                return Err("hvc0.sock exists".into()); // TODO this can happen on unclean shutdown
             }
         }
 
@@ -1835,6 +1832,7 @@ fn run_vm_daemon(
             timeout: LOGIN_EXPECT_TIMEOUT,
         },
         // Temporarily disable bash history and set commands starting with space to be ignored
+        // TODO history is currently broken.
         Send(" export HISTCONTROL=ignorespace".to_string()),
         Send(" unset HISTFILE".to_string()),
         // Our terminal is connected via /dev/hvc0 which Debian apparently keeps barebones.
