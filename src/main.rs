@@ -390,6 +390,7 @@ fn spawn_console_socket_proxy(connected_clients: Arc<AtomicI32>,
         let _hvc_out = hvc_out;
         let _hvc_in = hvc_in;
 
+        let disconnect_read_fd = disconnect_read.as_raw_fd();
         loop {
             // Blocking accept: wait for the next client.
             let (stream, _) = match listener.accept() {
@@ -403,7 +404,6 @@ fn spawn_console_socket_proxy(connected_clients: Arc<AtomicI32>,
             let _stream = stream;
             let mut buf = [0u8; 4096];
             let mut shutdown_wait: bool = false;
-            // let disconnect_read_fd = disconnect_read.as_raw_fd();
 
             'client: loop {
                 let mut fds = [
@@ -417,14 +417,14 @@ fn spawn_console_socket_proxy(connected_clients: Arc<AtomicI32>,
                         events: libc::POLLIN,
                         revents: 0,
                     },
-                    // libc::pollfd {
-                    //     fd: disconnect_read_fd,
-                    //     events: libc::POLLIN,
-                    //     revents: 0,
-                    // },
+                    libc::pollfd {
+                        fd: disconnect_read_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
                 ];
 
-                let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+                let ret = unsafe { libc::poll(fds.as_mut_ptr(), 3, -1) };
                 if ret < 0 {
                     // client disconnected
                     let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
@@ -486,22 +486,22 @@ fn spawn_console_socket_proxy(connected_clients: Arc<AtomicI32>,
                     }
                 }
 
-                // if fds[2].revents & libc::POLLIN != 0 {
-                //     let n = unsafe { libc::read(disconnect_read_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
-                //     if n <= 0 {
-                //         let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
-                //         break 'client;
-                //     } else {
-                //         let old_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
-                //         if old_val == 1 {
-                //             let msg = "VM shutting down...";
-                //             eprintln!("VM shutting down");
-                //             unsafe { libc::write(client_fd, msg.as_ptr() as *const _, msg.len()) };
-                //             let _ = done_tx.send(Ok(()));
-                //         }
-                //         break 'client;
-                //     }
-                // }
+                if fds[2].revents & libc::POLLIN != 0 {
+                    let n = unsafe { libc::read(disconnect_read_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+                    if n <= 0 {
+                        let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
+                        break 'client;
+                    } else {
+                        let old_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
+                        if old_val == 1 {
+                            let msg = "VM shutting down...";
+                            eprintln!("VM shutting down");
+                            unsafe { libc::write(client_fd, msg.as_ptr() as *const _, msg.len()) };
+                            let _ = done_tx.send(Ok(()));
+                        }
+                        break 'client;
+                    }
+                }
 
                 // if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
                 //     let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
@@ -1950,9 +1950,11 @@ fn run_vm(
         let hvc0_sock        = console_path.with_file_name("hvc0.sock");
         let hvc0_resize_sock = console_path.with_file_name("hvc0-resize.sock");
 
+        let mut disconnect_writes = vec![];
         for (i, (host_read, host_write, host_resize_write, disconnect_read, disconnect_write)) in
             host_console_fds.into_iter().enumerate()
         {
+            disconnect_writes.push(disconnect_write);
             eprintln!("spawning");
             spawn_console_socket_proxy(
                 Arc::clone(&connect_clients),
@@ -2013,10 +2015,16 @@ fn run_vm(
                                             eprintln!("disconnected /dev/hvc0");
                                             unsafe { libc::write(hvc0_disconnect_write.as_raw_fd(), b"x".as_ptr() as *const _, 1); };
                                         } else if byt == 98 { // b
+                                            let fd = disconnect_writes.get(0).unwrap().as_raw_fd();
+                                            unsafe { libc::write(fd, b"x".as_ptr() as *const _, 1); };
                                             eprintln!("disconnected /dev/hvc2");
                                         } else if byt == 99 { // c
+                                            let fd = disconnect_writes.get(1).unwrap().as_raw_fd();
+                                            unsafe { libc::write(fd, b"x".as_ptr() as *const _, 1); };
                                             eprintln!("disconnected /dev/hvc4");
                                         } else if byt == 100 { // d
+                                            let fd = disconnect_writes.get(2).unwrap().as_raw_fd();
+                                            unsafe { libc::write(fd, b"x".as_ptr() as *const _, 1); };
                                             eprintln!("disconnected /dev/hvc6");
                                         }
                                         i += 1;
