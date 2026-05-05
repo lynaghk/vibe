@@ -1,5 +1,10 @@
 cat > /root/.bash_logout <<EOF
-history -w
+
+if [[ "\$VIBE_POWEROFF" == "false" ]]; then
+  :
+else
+  history -w
+fi
 
 if [[ "\$VIBE_POWEROFF" == "false" ]]; then
   :
