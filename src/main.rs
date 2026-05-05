@@ -168,7 +168,7 @@ fn attach_console(
     let _stream = stream;
 
     // Send terminal resize events over the matching resize socket.
-    let resize_socket_path = chosen_resize_path.ok_or("Resize path not given?")?;
+    let resize_socket_path = chosen_resize_path.ok_or("Resize path not given")?;
     if !resize_socket_path.exists() {
         return Err(format!("Resize socket {} does not exist", resize_socket_path.display()).into());
     }
@@ -191,9 +191,9 @@ fn attach_console(
 
     let mut all_actions: Vec<LoginAction> =
         vec![
-            Send("".to_string()),
+            Send(" ".to_string()), // newline
             Expect {
-                text: "~#".to_string(),
+                text: "root@vibe".to_string(),
                 timeout: LOGIN_EXPECT_TIMEOUT,
             },
         ];
@@ -337,11 +337,11 @@ fn attach_console(
                     }
                     PollResult::Spurious => continue,
                     PollResult::Ready(bytes) => {
+                        let mut raw_guard_inner = raw_guard.lock().unwrap();
+                        if raw_guard_inner.is_none()
+                            && let Ok(guard) = enable_raw_mode(libc::STDIN_FILENO)
                         {
-                            let mut guard = raw_guard.lock().unwrap();
-                            if guard.is_none() {
-                                *guard = enable_raw_mode(libc::STDIN_FILENO).ok();
-                            }
+                            *raw_guard_inner = Some(guard);
                         }
                         let _ = stdout.write_all(bytes);
                         let _ = stdout.flush();
@@ -392,16 +392,37 @@ fn spawn_console_socket_proxy(connected_clients: Arc<AtomicI32>,
 
         loop {
             // Blocking accept: wait for the next client.
+            let begin_accept = Instant::now();
             let (stream, _) = match listener.accept() {
                 Ok(s) => s,
                 Err(_) => break,
             };
+            let block_time = Instant::now() - begin_accept;
 
             connected_clients.fetch_add(1, Ordering::SeqCst);
 
             let client_fd = stream.as_raw_fd();
             let _stream = stream;
             let mut buf = [0u8; 4096];
+
+            // Drain hvc_out before accepting data from the client if the pending data is old.
+            // Otherwise old terminal query codes will be written to the client. But hvc_in
+            // no longer waits for that input, and thus the terminal query response would be
+            // written to stdout.
+            // TODO: I am not sure 100 ms is a good limit for this
+            if block_time.as_millis() > 100 {
+                let mut fds = [
+                    libc::pollfd {
+                        fd: hvc_out_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                ];
+                let ret = unsafe { libc::poll(fds.as_mut_ptr(), 1, 0) };
+                if ret > 0 && fds[0].revents & libc::POLLIN != 0 {
+                    unsafe { libc::read(hvc_out_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+                }
+            }
 
             'client: loop {
                 let mut fds = [
@@ -648,11 +669,11 @@ fn run_daemon_vm(args: CliArgs, instance_dir: PathBuf) -> Result<(), Box<dyn std
     // temporarily disable automatic poweroff when logging out
     // login_actions.push(Send(" export VIBE_POWEROFF=false".to_string()));
 
-    // login_actions.push(Send(" exit".to_string()));
-    // login_actions.push(Expect {
-    //     text: "login:".to_string(),
-    //     timeout: LOGIN_EXPECT_TIMEOUT,
-    // });
+    login_actions.push(Send(" ".to_string())); // newline
+    login_actions.push(Expect {
+        text: "root@vibe".to_string(),
+        timeout: LOGIN_EXPECT_TIMEOUT,
+    });
 
     let instance_raw = instance_dir.join("instance.raw");
 
@@ -847,7 +868,7 @@ Options
             if Instant::now() >= deadline {
                 return Err("client: Timed out waiting for VM daemon to finish booting".into());
             }
-            thread::sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(10));
         }
         attach_console(project_root, parse_cli()?.login_actions, parse_cli()?.clear)
     } else {
@@ -1058,7 +1079,7 @@ fn motd_login_action(directory_shares: &[DirectoryShare]) -> Option<LoginAction>
         ));
     }
 
-    let command = format!(" cat <<'VIBE_MOTD' > /etc/vibe_motd\n{output}\nVIBE_MOTD\n");
+    let command = format!(" cat <<'VIBE_MOTD' > /etc/vibe_motd\n{output}\nVIBE_MOTD");
     Some(Send(command))
 }
 
@@ -1707,7 +1728,6 @@ fn spawn_login_actions_thread(
                 }
             }
         }
-        eprintln!("login actions done!");
     })
 }
 
@@ -1916,6 +1936,7 @@ fn run_vm_daemon(
         );
     }
 
+    // Read disconnect requests written to /dev/hvc1 by the VM
     thread::spawn(move || {
         // poll host_reads_resize_from
         let mut buf = [0u8; 4096];
@@ -1982,9 +2003,7 @@ fn run_vm_daemon(
                 let (vm_out, vm_in, resize) = io_ctx.shutdown();
                 // Write a single newline to trigger the display of the login prompt
                 // as the original prompt has already been consumed
-                unsafe {
-                    libc::write(vm_in.as_raw_fd(), "\n".as_ptr() as *const _, 1);
-                };
+                // unsafe { libc::write(vm_in.as_raw_fd(), "\n".as_ptr() as *const _, 1); }; // newline
                 spawn_console_socket_proxy(Arc::clone(&connect_clients),
                                            vm_out,
                                            vm_in,
