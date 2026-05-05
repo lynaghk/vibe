@@ -433,7 +433,6 @@ fn spawn_console_socket_proxy(connected_clients: Arc<AtomicI32>,
                     let n =
                         unsafe { libc::read(hvc_out_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
                     if n <= 0 {
-                        eprintln!("vm console gone");
                         maybe_shutdown_vm(Arc::clone(&connected_clients), client_fd, done_tx.clone());
                         return; // VM console gone
                     }
@@ -462,6 +461,7 @@ fn spawn_console_socket_proxy(connected_clients: Arc<AtomicI32>,
                 }
 
                 if fds[2].revents & libc::POLLIN != 0 {
+                    // consume disconnect request
                     let n = unsafe { libc::read(disconnect_read_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
                     if n <= 0 {
                         maybe_shutdown_vm(Arc::clone(&connected_clients), client_fd, done_tx.clone());
@@ -1209,7 +1209,6 @@ fn ensure_default_image(
         prepare_network_backend,
         DEFAULT_CPU_COUNT,
         DEFAULT_RAM_BYTES,
-        None,
     )?;
 
     Ok(())
@@ -1723,7 +1722,7 @@ fn run_vm_daemon(
     let (vm_reads_from, host_writes_to) = create_pipe(); // hvc0 host->guest
     let (we_read_from, vm_writes_to) = create_pipe(); // hvc0 host<-guest
     let (vm_reads_resize_from, host_write_resize_to) = create_pipe(); // hvc1 host->guest
-    let (host_reads_resize_from, vm_writes_resize_to) = create_pipe(); // hvc1 host<-guest
+    let (host_reads_disconnect_request, vm_writes_resize_to) = create_pipe(); // hvc1 host<-guest
     let (hvc0_disconnect_read, hvc0_disconnect_write) = create_pipe(); // hvc1 exit => attached console
 
     // hvc2/hvc3, hvc4/hvc5, hvc6/hvc7 — one console+resize pair per attach slot.
@@ -1916,6 +1915,57 @@ fn run_vm_daemon(
         );
     }
 
+    thread::spawn(move || {
+        // poll host_reads_resize_from
+        let mut buf = [0u8; 4096];
+        loop {
+            let mut fds = [
+                libc::pollfd {
+                    fd: host_reads_disconnect_request.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let ret = unsafe { libc::poll(fds.as_mut_ptr(), 1, -1) };
+            if ret == 0 {
+                // eprintln!("timeout!");
+            } else if ret == -1 {
+                eprintln!("Error!");
+                return;
+            } else if fds[0].revents & libc::POLLIN != 0 { // data from /dev/hvc1
+                let n =
+                    unsafe { libc::read(host_reads_disconnect_request.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
+                if n <= 0 {
+                    return;
+                } else {
+                    // eprintln!("received data from client /dev/hvc1: {n}");
+                    let slice = &buf[..n as usize];
+                    let mut i = 0;
+                    while i < slice.len() {
+                        let byt = slice[i];
+                        if byt == 97 { // a
+                            unsafe { libc::write(hvc0_disconnect_write.as_raw_fd(), b"x".as_ptr() as *const _, 1); };
+                        } else if byt == 98 { // b
+                            let fd = disconnect_writes.get(0).unwrap().as_raw_fd();
+                            unsafe { libc::write(fd, b"x".as_ptr() as *const _, 1); };
+                        } else if byt == 99 { // c
+                            let fd = disconnect_writes.get(1).unwrap().as_raw_fd();
+                            unsafe { libc::write(fd, b"x".as_ptr() as *const _, 1); };
+                        } else if byt == 100 { // d
+                            let fd = disconnect_writes.get(2).unwrap().as_raw_fd();
+                            unsafe { libc::write(fd, b"x".as_ptr() as *const _, 1); };
+                        }
+                        i += 1;
+                    }
+                }
+            } else {
+                // POLLHUP / POLLERR / POLLNVAL — fd is gone
+                eprintln!("poll: unexpected revents: {:#x}", fds[0].revents);
+                return;
+            }
+        }
+    });
+
     // Supervisor: waits for login actions, shuts down spawn_vm_io, then
     // hands the recovered hvc0 FDs to a socket proxy.
     thread::spawn(move || {
@@ -1929,56 +1979,6 @@ fn run_vm_daemon(
             }
             _ => {
                 let (vm_out, vm_in, resize) = io_ctx.shutdown();
-                thread::spawn(move || {
-                    // poll host_reads_resize_from
-                    let mut buf = [0u8; 4096];
-                    loop {
-                        let mut fds = [
-                            libc::pollfd {
-                                fd: host_reads_resize_from.as_raw_fd(),
-                                events: libc::POLLIN,
-                                revents: 0,
-                            },
-                        ];
-                        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 1, 1000) };
-                        if ret == 0 {
-                            // eprintln!("timeout!");
-                        } else if ret == -1 {
-                            eprintln!("Error!");
-                            return;
-                        } else if fds[0].revents & libc::POLLIN != 0 { // data from /dev/hvc1
-                            let n =
-                                unsafe { libc::read(host_reads_resize_from.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
-                            if n <= 0 {
-                                return;
-                            } else {
-                                // eprintln!("received data from client /dev/hvc1: {n}");
-                                let slice = &buf[..n as usize];
-                                let mut i = 0;
-                                while i < slice.len() {
-                                    let byt = slice[i];
-                                    if byt == 97 { // a
-                                        unsafe { libc::write(hvc0_disconnect_write.as_raw_fd(), b"x".as_ptr() as *const _, 1); };
-                                    } else if byt == 98 { // b
-                                        let fd = disconnect_writes.get(0).unwrap().as_raw_fd();
-                                        unsafe { libc::write(fd, b"x".as_ptr() as *const _, 1); };
-                                    } else if byt == 99 { // c
-                                        let fd = disconnect_writes.get(1).unwrap().as_raw_fd();
-                                        unsafe { libc::write(fd, b"x".as_ptr() as *const _, 1); };
-                                    } else if byt == 100 { // d
-                                        let fd = disconnect_writes.get(2).unwrap().as_raw_fd();
-                                        unsafe { libc::write(fd, b"x".as_ptr() as *const _, 1); };
-                                    }
-                                    i += 1;
-                                }
-                            }
-                        } else {
-                            // POLLHUP / POLLERR / POLLNVAL — fd is gone
-                            eprintln!("poll: unexpected revents: {:#x}", fds[0].revents);
-                            return;
-                        }
-                    }
-                });
                 // Write a single newline to trigger the display of the login prompt
                 // as the original prompt has already been consumed
                 unsafe {
@@ -2056,33 +2056,11 @@ fn run_vm_provision(
     prepare_network_backend: impl Fn() -> PreparedNetworkBackend,
     cpu_count: usize,
     ram_bytes: u64,
-    console_socket_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (vm_reads_from, host_writes_to) = create_pipe(); // hvc0 host->guest
     let (we_read_from, vm_writes_to) = create_pipe(); // hvc0 host<-guest
     let (vm_reads_resize_from, host_write_resize_to) = create_pipe(); // hvc1 host->guest
     let (host_reads_resize_from, vm_writes_resize_to) = create_pipe(); // hvc1 host<-guest
-    let (hvc0_disconnect_read, hvc0_disconnect_write) = create_pipe(); // hvc1 exit => attached console
-
-    // hvc2/hvc3, hvc4/hvc5, hvc6/hvc7 — one console+resize pair per attach slot.
-    const N_CONSOLE_SLOTS: usize = 3;
-    let (vm_extra_consoles, host_console_fds): (Vec<_>, Vec<_>) =
-        if console_socket_path.is_some() {
-            (0..N_CONSOLE_SLOTS)
-                .map(|_| {
-                    let (reads_from, we_write) = create_pipe();
-                    let (we_read, writes_to) = create_pipe();
-                    let (resize_reads_from, host_write_resize) = create_pipe();
-                    let (disconnect_read, disconnect_write) = create_pipe();
-                    (
-                        (reads_from, writes_to, resize_reads_from),
-                        (we_read, we_write, host_write_resize, disconnect_read, disconnect_write),
-                    )
-                })
-                .unzip()
-        } else {
-            (vec![], vec![])
-        };
 
     let mut prepared_network_backend = prepare_network_backend();
     let config = create_vm_configuration(
@@ -2144,11 +2122,6 @@ fn run_vm_provision(
     }
 
     println!("VM booting...");
-    let connect_clients = Arc::new(AtomicI32::new(0));
-    const CONSOLE_SOCK_NAMES: [&str; N_CONSOLE_SLOTS] =
-        ["hvc2.sock", "hvc4.sock", "hvc6.sock"];
-    const RESIZE_SOCK_NAMES: [&str; N_CONSOLE_SLOTS] =
-        ["hvc2-resize.sock", "hvc4-resize.sock", "hvc6-resize.sock"];
 
     let mut all_login_actions = vec![
         Expect {
@@ -2192,270 +2165,67 @@ fn run_vm_provision(
         }
     }
 
-    if console_socket_path.is_some() {
-        all_login_actions.push(Send(script_command_from_content(
-            "bash_logout.sh",
-            BASH_LOGOUT_SCRIPT,
-        )?));
-        // Start getty on hvc2/4/6 so attach_console can connect to them.
-        all_login_actions.push(Send(
-            " systemctl start serial-getty@hvc2.service serial-getty@hvc4.service serial-getty@hvc6.service"
-                .to_string(),
-        ));
-        // Resize handlers: read resize events from hvcN+1 and apply them to hvcN.
-        for (console, resize) in [(2u8, 3u8), (4, 5), (6, 7)] {
-            all_login_actions.push(Send(format!(
-                " sh -c '(while IFS=\" \" read -s -r rows cols; \
-                  do stty -F /dev/hvc{console} rows \"$rows\" cols \"$cols\"; done) \
-                  < /dev/hvc{resize} >/dev/null 2>&1 &'"
-            )));
-        }
-    }
-
     for a in login_actions {
         all_login_actions.push(a.clone())
     }
 
-    if let Some(ref console_path) = console_socket_path {
-        // eprintln!("Daemon mode ...");
-        // ── Daemon mode ────────────────────────────────────────────────────────
-        // Use spawn_vm_io to wire hvc0 to stdin/stdout during boot so that boot
-        // output is visible.  After login completes the supervisor shuts down
-        // spawn_vm_io, recovers the raw hvc0 FDs, and hands them to the socket
-        // proxy so that `attach_console` can connect.
+    // ── Provisioning mode ──────────────────────────────────────────────────
+    // Wire hvc0 directly to stdin/stdout so the operator can watch progress.
 
-        let output_monitor = Arc::new(OutputMonitor::default());
-        let io_ctx = spawn_vm_io(
-            output_monitor.clone(),
-            we_read_from,
-            host_writes_to,
-            host_write_resize_to,
-        );
+    let output_monitor = Arc::new(OutputMonitor::default());
+    let io_ctx = spawn_vm_io(
+        output_monitor.clone(),
+        we_read_from,
+        host_writes_to,
+        host_write_resize_to,
+    );
 
-        let (vm_output_tx, vm_output_rx) = mpsc::channel::<VmOutput>();
-        let login_thread = spawn_login_actions_thread(
-            all_login_actions,
-            output_monitor,
-            io_ctx.input_tx.clone(),
-            vm_output_tx,
-        );
+    let (vm_output_tx, vm_output_rx) = mpsc::channel::<VmOutput>();
+    let login_actions_thread = spawn_login_actions_thread(
+        all_login_actions,
+        output_monitor,
+        io_ctx.input_tx.clone(),
+        vm_output_tx,
+    );
 
-        // Channel used by the supervisor to report success or a timeout error.
-        let (done_tx, done_rx) = mpsc::channel::<Result<(), String>>();
+    let mut exit_result: Result<(), Box<dyn std::error::Error>> = Ok(());
+    loop {
+        unsafe {
+            NSRunLoop::mainRunLoop().runMode_beforeDate(
+                NSDefaultRunLoopMode,
+                &NSDate::dateWithTimeIntervalSinceNow(0.2),
+            )
+        };
 
-        let hvc0_sock        = console_path.with_file_name("hvc0.sock");
-        let hvc0_resize_sock = console_path.with_file_name("hvc0-resize.sock");
-
-        let mut disconnect_writes = vec![];
-        for (i, (host_read, host_write, host_resize_write, disconnect_read, disconnect_write)) in
-            host_console_fds.into_iter().enumerate()
-        {
-            disconnect_writes.push(disconnect_write);
-            spawn_console_socket_proxy(
-                Arc::clone(&connect_clients),
-                host_read,
-                host_write,
-                disconnect_read,
-                done_tx.clone(),
-                console_path.with_file_name(CONSOLE_SOCK_NAMES[i]),
-            );
-            spawn_console_resize_proxy(
-                host_resize_write,
-                console_path.with_file_name(RESIZE_SOCK_NAMES[i]),
-            );
-        }
-
-        // Supervisor: waits for login actions, shuts down spawn_vm_io, then
-        // hands the recovered hvc0 FDs to a socket proxy.
-        thread::spawn(move || {
-            login_thread.join().ok();
-
-            match vm_output_rx.try_recv() {
-                Ok(VmOutput::LoginActionTimeout { action, timeout }) => {
-                    let _ = done_tx.send(Err(format!(
-                        "Login action ({action}) timed out after {timeout:?}; shutting down."
-                    )));
-                }
-                _ => {
-                    let (vm_out, vm_in, resize) = io_ctx.shutdown();
-                    thread::spawn(move || {
-                        // poll host_reads_resize_from
-                        let mut buf = [0u8; 4096];
-                        loop {
-                            let mut fds = [
-                                libc::pollfd {
-                                    fd: host_reads_resize_from.as_raw_fd(),
-                                    events: libc::POLLIN,
-                                    revents: 0,
-                                },
-                            ];
-                            let ret = unsafe { libc::poll(fds.as_mut_ptr(), 1, 1000) };
-                            if ret == 0 {
-                                // eprintln!("timeout!");
-                            } else if ret == -1 {
-                                eprintln!("Error!");
-                                return;
-                            } else if fds[0].revents & libc::POLLIN != 0 { // data from /dev/hvc1
-                                let n =
-                                    unsafe { libc::read(host_reads_resize_from.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
-                                if n <= 0 {
-                                    return;
-                                } else {
-                                    // eprintln!("received data from client /dev/hvc1: {n}");
-                                    let slice = &buf[..n as usize];
-                                    let mut i = 0;
-                                    while i < slice.len() {
-                                        let byt = slice[i];
-                                        if byt == 97 { // a
-                                            unsafe { libc::write(hvc0_disconnect_write.as_raw_fd(), b"x".as_ptr() as *const _, 1); };
-                                        } else if byt == 98 { // b
-                                            let fd = disconnect_writes.get(0).unwrap().as_raw_fd();
-                                            unsafe { libc::write(fd, b"x".as_ptr() as *const _, 1); };
-                                        } else if byt == 99 { // c
-                                            let fd = disconnect_writes.get(1).unwrap().as_raw_fd();
-                                            unsafe { libc::write(fd, b"x".as_ptr() as *const _, 1); };
-                                        } else if byt == 100 { // d
-                                            let fd = disconnect_writes.get(2).unwrap().as_raw_fd();
-                                            unsafe { libc::write(fd, b"x".as_ptr() as *const _, 1); };
-                                        }
-                                        i += 1;
-                                    }
-                                }
-                            } else {
-                                // POLLHUP / POLLERR / POLLNVAL — fd is gone
-                                eprintln!("poll: unexpected revents: {:#x}", fds[0].revents);
-                                return;
-                            }
-                        }
-                    });
-                    // Write a single newline to trigger the display of the login prompt
-                    // as the original prompt has already been consumed
-                    unsafe {
-                         libc::write(vm_in.as_raw_fd(), "\n".as_ptr() as *const _, 1);
-                    };
-                    spawn_console_socket_proxy(Arc::clone(&connect_clients),
-                                               vm_out,
-                                               vm_in,
-                                               hvc0_disconnect_read,
-                                               done_tx,
-                                               hvc0_sock);
-                    spawn_console_resize_proxy(resize, hvc0_resize_sock);
-                }
-            }
-        });
-
-        // Main loop: keep pumping the run-loop so the VM stays alive.
-        let mut exit_result: Result<(), Box<dyn std::error::Error>> = Ok(());
-        loop {
-            unsafe {
-                NSRunLoop::mainRunLoop().runMode_beforeDate(
-                    NSDefaultRunLoopMode,
-                    &NSDate::dateWithTimeIntervalSinceNow(0.2),
+        let state = unsafe { vm.state() };
+        match vm_output_rx.try_recv() {
+            Ok(VmOutput::LoginActionTimeout { action, timeout }) => {
+                exit_result = Err(format!(
+                    "Login action ({action}) timed out after {timeout:?}; shutting down."
                 )
-            };
-
-            match done_rx.try_recv() {
-                Ok(Err(msg)) => {
-                    exit_result = Err(msg.into());
-                    unsafe {
-                        if vm.canRequestStop() {
-                            vm.requestStopWithError().ok();
-                        } else if vm.canStop() {
-                            vm.stopWithCompletionHandler(&RcBlock::new(|_: *mut NSError| {}));
+                .into());
+                unsafe {
+                    if vm.canRequestStop() {
+                        if let Err(err) = vm.requestStopWithError() {
+                            eprintln!("Failed to request VM stop: {:?}", err);
                         }
+                    } else if vm.canStop() {
+                        let handler = RcBlock::new(|_error: *mut NSError| {});
+                        vm.stopWithCompletionHandler(&handler);
                     }
-                    break;
                 }
-                Ok(Ok(())) => {
-                    exit_result = Ok(());
-                    unsafe {
-                        if vm.canRequestStop() {
-                            vm.requestStopWithError().ok();
-                        } else if vm.canStop() {
-                            vm.stopWithCompletionHandler(&RcBlock::new(|_: *mut NSError| {}));
-                        }
-                    }
-                    break;
-                }
-                Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => {}
-            }
-
-            if unsafe { vm.state() } != objc2_virtualization::VZVirtualMachineState::Running {
                 break;
             }
+            Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => {}
         }
-        // eprintln!("VM poweroff");
-
-        // Clean up all socket files.
-        let base = console_path;
-        for name in ["hvc0.sock", "hvc0-resize.sock"]
-            .iter()
-            .chain(CONSOLE_SOCK_NAMES.iter())
-            .chain(RESIZE_SOCK_NAMES.iter())
-        {
-            let _ = fs::remove_file(base.with_file_name(name));
+        if state != objc2_virtualization::VZVirtualMachineState::Running {
+            break;
         }
-
-        exit_result
-    } else {
-        // ── Provisioning mode ──────────────────────────────────────────────────
-        // Wire hvc0 directly to stdin/stdout so the operator can watch progress.
-
-        let output_monitor = Arc::new(OutputMonitor::default());
-        let io_ctx = spawn_vm_io(
-            output_monitor.clone(),
-            we_read_from,
-            host_writes_to,
-            host_write_resize_to,
-        );
-
-        let (vm_output_tx, vm_output_rx) = mpsc::channel::<VmOutput>();
-        let login_actions_thread = spawn_login_actions_thread(
-            all_login_actions,
-            output_monitor,
-            io_ctx.input_tx.clone(),
-            vm_output_tx,
-        );
-
-        let mut exit_result: Result<(), Box<dyn std::error::Error>> = Ok(());
-        loop {
-            unsafe {
-                NSRunLoop::mainRunLoop().runMode_beforeDate(
-                    NSDefaultRunLoopMode,
-                    &NSDate::dateWithTimeIntervalSinceNow(0.2),
-                )
-            };
-
-            let state = unsafe { vm.state() };
-            match vm_output_rx.try_recv() {
-                Ok(VmOutput::LoginActionTimeout { action, timeout }) => {
-                    exit_result = Err(format!(
-                        "Login action ({action}) timed out after {timeout:?}; shutting down."
-                    )
-                    .into());
-                    unsafe {
-                        if vm.canRequestStop() {
-                            if let Err(err) = vm.requestStopWithError() {
-                                eprintln!("Failed to request VM stop: {:?}", err);
-                            }
-                        } else if vm.canStop() {
-                            let handler = RcBlock::new(|_error: *mut NSError| {});
-                            vm.stopWithCompletionHandler(&handler);
-                        }
-                    }
-                    break;
-                }
-                Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => {}
-            }
-            if state != objc2_virtualization::VZVirtualMachineState::Running {
-                break;
-            }
-        }
-
-        login_actions_thread.join().ok();
-        io_ctx.shutdown();
-        exit_result
     }
+
+    login_actions_thread.join().ok();
+    io_ctx.shutdown();
+    exit_result
 }
 
 fn nsurl_from_path(path: &Path) -> Result<Retained<NSURL>, Box<dyn std::error::Error>> {
