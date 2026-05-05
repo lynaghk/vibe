@@ -180,6 +180,7 @@ fn attach_console(
                     if resize_stream.write_all(msg.as_bytes()).is_err() {
                         break;
                     }
+                    resize_stream.flush().unwrap();
                 }
                 thread::sleep(Duration::from_millis(100));
             }
@@ -1826,7 +1827,7 @@ fn run_vm_daemon(
         // In background, continuously read host terminal resizes sent over hvc1 and update hvc0.
         Send({
             // sorry for this nonsense, the string is so long it angers rustfmt =(
-            const S: &str = " sh -c '(while IFS=\" \" read -s -r rows cols; do stty -F /dev/hvc0 rows \"$rows\" cols \"$cols\"; done) < /dev/hvc1 >/dev/null 2>&1 &'";
+            const S: &str = " sh -c '(while IFS=\" \" read -r rows cols; do stty -F /dev/hvc0 rows \"$rows\" cols \"$cols\"; done) < /dev/hvc1 >/dev/null 2>&1 &'";
             S.to_string()
         }),
     ];
@@ -1858,7 +1859,7 @@ fn run_vm_daemon(
     // Resize handlers: read resize events from hvcN+1 and apply them to hvcN.
     for (console, resize) in [(2u8, 3u8), (4, 5), (6, 7)] {
         all_login_actions.push(Send(format!(
-            " sh -c '(while IFS=\" \" read -s -r rows cols; \
+            " sh -c '(while IFS=\" \" read -r rows cols; \
               do stty -F /dev/hvc{console} rows \"$rows\" cols \"$cols\"; done) \
               < /dev/hvc{resize} >/dev/null 2>&1 &'"
         )));
