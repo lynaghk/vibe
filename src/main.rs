@@ -198,11 +198,12 @@ fn attach_console(
             },
         ];
 
-    let abspath = env::current_dir()?
-        .into_os_string()
+    let project_name = project_root
+        .file_name()
+        .ok_or("Project directory has no name")?
         .to_string_lossy()
         .into_owned();
-    all_actions.push(Send(format!(" cd {abspath}")));
+    all_actions.push(Send(format!(" cd {project_name}")));
 
     if clear {
         all_actions.push(Send(" clear && cat /etc/vibe_motd".to_string()));
@@ -585,23 +586,23 @@ fn run_daemon_vm(args: CliArgs, instance_dir: PathBuf) -> Result<(), Box<dyn std
     let mut directory_shares = Vec::new();
 
     if !args.no_default_mounts {
-        let abspath = env::current_dir()?
-            .into_os_string()
+        let project_name = project_root
+            .file_name()
+            .ok_or("Project directory has no name")?
             .to_string_lossy()
             .into_owned();
-        login_actions.push(Send(format!(" cd {abspath}")));
 
         // Discourage read/write of project dir subfolders within the VM.
         // Note that this isn't secure, since the VM runs as root and could unmount this.
         // I couldn't find an alternative way to do this --- the MacOS sandbox doesn't apply to the Apple Virtualization system =(
         for subfolder in [".git", ".vibe"] {
             if project_root.join(subfolder).exists() {
-                login_actions.push(Send(format!(r" mount -t tmpfs tmpfs {}", subfolder)))
+                login_actions.push(Send(format!(r" mount -t tmpfs tmpfs /root/{project_name}/{}", subfolder)));
             }
         }
 
         directory_shares.push(
-            DirectoryShare::new(project_root, env::current_dir()?, false)
+            DirectoryShare::new(project_root, PathBuf::from("/root/").join(project_name), false)
                 .expect("Project directory must exist"),
         );
 
@@ -661,13 +662,11 @@ fn run_daemon_vm(args: CliArgs, instance_dir: PathBuf) -> Result<(), Box<dyn std
         login_actions.push(motd_action);
     }
 
+    // TODO:
     // if the vibe client attaching aborts _before_ actually logging in,
     // we still want to shutdown the VM:
     // const S: &str = " bash -c '(while true; do sleep 3; if [[ \"$(who | wc -l | tr -d \" \")\" == \"0\" ]]; then echo \"VM powering off...\"; systemctl poweroff; fi; done) 2>&1 &'";
     // login_actions.push(Send(S.to_string()));
-
-    // temporarily disable automatic poweroff when logging out
-    // login_actions.push(Send(" export VIBE_POWEROFF=false".to_string()));
 
     login_actions.push(Send(" ".to_string())); // newline
     login_actions.push(Expect {
