@@ -14,8 +14,9 @@ apt-get install -y --no-install-recommends      \
         libssl-dev                              \
         curl                                    \
         git                                     \
-        ripgrep                                 \
-        sysstat
+        tmux                                    \
+        ripgrep
+
 
 # Expand disk partition
 growpart /dev/vda 1
@@ -29,50 +30,49 @@ hostnamectl set-hostname vibe
 # Don't display "Last login from ..." on logins
 touch .hushlogin
 
+cat > /root/.bashrc <<EOF
 # Set this env var so claude doesn't complain about running as root.
-echo "export IS_SANDBOX=1" >> .bashrc
+export IS_SANDBOX=1
 
 # Set this environment variable to prevent the Gemini CLI from failing to identify the sandbox command
-echo "export GEMINI_SANDBOX=false" >> .bashrc
+export GEMINI_SANDBOX=false
 
 # Enable true color support in the terminal
-echo "export COLORTERM=truecolor" >> .bashrc
+export COLORTERM=truecolor
 
 # Hide commands beginning with space from the history
-echo "export HISTCONTROL=ignorespace" >> .bashrc
+export HISTCONTROL=ignorespace
 
 # Unlimited bash history
-echo "export HISTFILESIZE=" >> .bashrc
-echo "export HISTSIZE=" >> .bashrc
+export HISTFILESIZE=
+export HISTSIZE=
+
+# Use append mode for history
+shopt -s histappend
+# Write history after every command
+PROMPT_COMMAND+=("history -a")
+EOF
 
 # Shutdown the VM when you logout
-cat > .bash_logout <<EOF
-history -w # Write bash history. Otherwise bash would be killed by poweroff without having written history
+cat > /root/.bash_logout <<EOF
 
-echo "bash logout for tty: \$(tty) ..."
-
-# Turn off the VM when the last user logs out.
-if [[ "\$(tty)" == "/dev/hvc0" ]]; then
-  # we are the primary terminal
-  if [[ "\$(who | wc -l)" == "1" ]]; then
-    # we are the last open terminal
-    echo "VM powering off..."
-    systemctl poweroff
-    sleep 100 # sleep here so that we don't see the login screen flash up before the shutdown.
-  else
-    echo ""
-    echo "VM not powering off as there are terminals connected"
-  fi
-else
-  # we are a ssh session
-  if [[ "\$(who | wc -l)" == "1" ]]; then
-    # we are the last open terminal
-    echo "VM powering off..."
-    systemctl poweroff
-  else
-    echo "Detaching..."
-    printf '\033]9999\007' > /dev/hvc2
-  fi
+if [[ "/dev/hvc0" == "\$(tty)" ]]; then
+  # Sync file system before VM poweroff. Otherwise we may lose recent bash history
+  sync --file-system /root
+  printf 'a' > /dev/hvc1
+  sleep 0.1
+elif [[ "/dev/hvc2" == "\$(tty)" ]]; then
+  sync --file-system /root
+  printf 'b' > /dev/hvc1
+  sleep 0.1
+elif [[ "/dev/hvc4" == "\$(tty)" ]]; then
+  sync --file-system /root
+  printf 'c' > /dev/hvc1
+  sleep 0.1
+elif [[ "/dev/hvc6" == "\$(tty)" ]]; then
+  sync --file-system /root
+  printf 'd' > /dev/hvc1
+  sleep 0.1
 fi
 EOF
 
@@ -108,6 +108,7 @@ cat > .config/mise/config.toml <<MISE
     "npm:@openai/codex" = "latest"
     "npm:@anthropic-ai/claude-code" = "latest"
     "npm:@google/gemini-cli" = "latest"
+    "npm:@mariozechner/pi-coding-agent" = "latest"
 MISE
 
 touch .config/mise/mise.lock

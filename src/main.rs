@@ -409,7 +409,7 @@ fn spawn_console_socket_proxy(connected_clients: Arc<AtomicI32>,
             // Drain hvc_out before accepting data from the client if the pending data is old.
             // Otherwise old terminal query codes will be written to the client. But hvc_in
             // no longer waits for that input, and thus the terminal query response would be
-            // written to stdout.
+            // written to stdout and look like "^[[36;1R^[[36;148R^[[36;148R^[[36;148R".
             // TODO: I am not sure 100 ms is a good limit for this
             if block_time.as_millis() > 100 {
                 let mut fds = [
@@ -535,6 +535,57 @@ fn spawn_console_resize_proxy(hvc_in: OwnedFd, socket_path: PathBuf) {
     });
 }
 
+fn spawn_disconnect_request(host_reads_disconnect_request: OwnedFd, disconnect_writes: Vec<OwnedFd>) {
+    thread::spawn(move || {
+        // poll host_reads_disconnect_request (hvc1)
+        let mut buf = [0u8; 4096];
+        loop {
+            let mut fds = [
+                libc::pollfd {
+                    fd: host_reads_disconnect_request.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            let ret = unsafe { libc::poll(fds.as_mut_ptr(), 1, -1) };
+            if ret == 0 {
+                // eprintln!("timeout!");
+            } else if ret == -1 {
+                eprintln!("Error!");
+                return;
+            } else if fds[0].revents & libc::POLLIN != 0 { // data from /dev/hvc1
+                let n =
+                    unsafe { libc::read(host_reads_disconnect_request.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
+                if n <= 0 {
+                    return;
+                } else {
+                    // eprintln!("received data from client /dev/hvc1: {n}");
+                    let slice = &buf[..n as usize];
+                    let mut i = 0;
+                    while i < slice.len() {
+                        let byt = slice[i];
+                        // we need to use the "special" characters a, b, c and d to signify
+                        // hvc0, 2, 4 and 6
+                        // because when hvc1 reads resize events from the host, it will echo
+                        // those values back. Thus we unfortunately have to use these special
+                        // characters and simply ignore everything else (echo-ed resize events).
+                        if byt >= 97 && byt <= 100 { // a..d
+                            let idx = byt - 97;
+                            let fd = disconnect_writes.get(idx as usize).unwrap().as_raw_fd();
+                            unsafe { libc::write(fd, b"x".as_ptr() as *const _, 1); };
+                        }
+                        i += 1;
+                    }
+                }
+            } else {
+                // POLLHUP / POLLERR / POLLNVAL — fd is gone
+                eprintln!("poll: unexpected revents: {:#x}", fds[0].revents);
+                return;
+            }
+        }
+    });
+}
+
 /// Try to acquire an exclusive advisory lock on `instance_dir/instance.lock`.
 ///
 /// The file is opened **without** `O_CLOEXEC` so that the daemon process
@@ -571,7 +622,7 @@ fn try_acquire_instance_lock(instance_dir: &Path) -> io::Result<Option<libc::c_i
     }
 }
 
-fn run_daemon_vm(args: CliArgs, instance_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn main_daemon(args: CliArgs, instance_dir: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let home = env::var("HOME").map(PathBuf::from)?;
     let cache_home = env::var("XDG_CACHE_HOME")
         .map(PathBuf::from)
@@ -656,9 +707,9 @@ fn run_daemon_vm(args: CliArgs, instance_dir: PathBuf) -> Result<(), Box<dyn std
     }
 
     // Enable bash history
-    login_actions.push(Send(" export HISTFILE=/root/.bash_history".to_string()));
+    // login_actions.push(Send(" export HISTFILE=/root/.bash_history".to_string()));
 
-    if let Some(motd_action) = motd_login_action(&directory_shares) {
+    if let Some(motd_action) = create_motd(&directory_shares) {
         login_actions.push(motd_action);
     }
 
@@ -833,12 +884,6 @@ Options
         // The instance-lock file descriptor was opened without O_CLOEXEC, so the
         // daemon inherits it across the exec call and holds the lock for its entire
         // lifetime — preventing a second `vibe` from starting a second VM.
-        // let log_file = fs::OpenOptions::new()
-        //     .write(true)
-        //     .create(true)
-        //     .truncate(true)
-        //     .open(instance_dir.join("daemon.log"))?;
-        // eprintln!("Spawning VM daemon...");
         let mut child: Option<Child> = None;
         if !parse_cli()?.attach {
             child = Some(Command::new(env::current_exe()?)
@@ -872,7 +917,7 @@ Options
         // At this point the VM is provisioned. The VM is now powered off.
         // Run the VM and keep it alive.
         // The instance lock is already held via the inherited file descriptor.
-        run_daemon_vm(args, instance_dir)
+        main_daemon(args, instance_dir)
     }
 }
 
@@ -1004,7 +1049,7 @@ fn script_command_from_content(
     let guest_dir = "/tmp/vibe-scripts";
     let guest_path = format!("{guest_dir}/{label}.sh");
     let command = format!(
-        " mkdir -p {guest_dir}\ncat >{guest_path} <<'{marker}'\n{script}\n{marker}\nchmod +x {guest_path}\n {guest_path}"
+        " mkdir -p {guest_dir}\n cat >{guest_path} <<'{marker}'\n{script}\n{marker}\n chmod +x {guest_path}\n {guest_path}"
     );
     if script.contains(marker) {
         return Err(
@@ -1014,7 +1059,7 @@ fn script_command_from_content(
     Ok(command)
 }
 
-fn motd_login_action(directory_shares: &[DirectoryShare]) -> Option<LoginAction> {
+fn create_motd(directory_shares: &[DirectoryShare]) -> Option<LoginAction> {
     if directory_shares.is_empty() {
         return Some(Send(" clear".into()));
     }
@@ -1831,10 +1876,6 @@ fn run_vm_daemon(
             text: "~#".to_string(),
             timeout: LOGIN_EXPECT_TIMEOUT,
         },
-        // Temporarily disable bash history and set commands starting with space to be ignored
-        // TODO history is currently broken.
-        Send(" export HISTCONTROL=ignorespace".to_string()),
-        Send(" unset HISTFILE".to_string()),
         // Our terminal is connected via /dev/hvc0 which Debian apparently keeps barebones.
         // We want sane terminal defaults like icrnl (translating carriage returns into newlines)
         Send(" stty -F /dev/hvc0 sane".to_string()),
@@ -1882,12 +1923,6 @@ fn run_vm_daemon(
         )));
     }
 
-    let connect_clients = Arc::new(AtomicI32::new(0));
-    const CONSOLE_SOCK_NAMES: [&str; N_CONSOLE_SLOTS] =
-        ["hvc2.sock", "hvc4.sock", "hvc6.sock"];
-    const RESIZE_SOCK_NAMES: [&str; N_CONSOLE_SLOTS] =
-        ["hvc2-resize.sock", "hvc4-resize.sock", "hvc6-resize.sock"];
-
     for a in login_actions {
         all_login_actions.push(a.clone())
     }
@@ -1911,16 +1946,22 @@ fn run_vm_daemon(
     // Channel used by the supervisor to report success or a timeout error.
     let (done_tx, done_rx) = mpsc::channel::<Result<(), String>>();
 
-    let hvc0_sock        = console_path.with_file_name("hvc0.sock");
+    let hvc0_sock = console_path.with_file_name("hvc0.sock");
     let hvc0_resize_sock = console_path.with_file_name("hvc0-resize.sock");
 
-    let mut disconnect_writes = vec![];
+    let connected_clients = Arc::new(AtomicI32::new(0));
+    const CONSOLE_SOCK_NAMES: [&str; N_CONSOLE_SLOTS] =
+        ["hvc2.sock", "hvc4.sock", "hvc6.sock"];
+    const RESIZE_SOCK_NAMES: [&str; N_CONSOLE_SLOTS] =
+        ["hvc2-resize.sock", "hvc4-resize.sock", "hvc6-resize.sock"];
+
+    let mut disconnect_writes = vec![hvc0_disconnect_write];
     for (i, (host_read, host_write, host_resize_write, disconnect_read, disconnect_write)) in
         host_console_fds.into_iter().enumerate()
     {
         disconnect_writes.push(disconnect_write);
         spawn_console_socket_proxy(
-            Arc::clone(&connect_clients),
+            Arc::clone(&connected_clients),
             host_read,
             host_write,
             disconnect_read,
@@ -1933,57 +1974,8 @@ fn run_vm_daemon(
         );
     }
 
-    // Read disconnect requests written to /dev/hvc1 by the VM
-    thread::spawn(move || {
-        // poll host_reads_resize_from
-        let mut buf = [0u8; 4096];
-        loop {
-            let mut fds = [
-                libc::pollfd {
-                    fd: host_reads_disconnect_request.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-            ];
-            let ret = unsafe { libc::poll(fds.as_mut_ptr(), 1, -1) };
-            if ret == 0 {
-                // eprintln!("timeout!");
-            } else if ret == -1 {
-                eprintln!("Error!");
-                return;
-            } else if fds[0].revents & libc::POLLIN != 0 { // data from /dev/hvc1
-                let n =
-                    unsafe { libc::read(host_reads_disconnect_request.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
-                if n <= 0 {
-                    return;
-                } else {
-                    // eprintln!("received data from client /dev/hvc1: {n}");
-                    let slice = &buf[..n as usize];
-                    let mut i = 0;
-                    while i < slice.len() {
-                        let byt = slice[i];
-                        if byt == 97 { // a
-                            unsafe { libc::write(hvc0_disconnect_write.as_raw_fd(), b"x".as_ptr() as *const _, 1); };
-                        } else if byt == 98 { // b
-                            let fd = disconnect_writes.get(0).unwrap().as_raw_fd();
-                            unsafe { libc::write(fd, b"x".as_ptr() as *const _, 1); };
-                        } else if byt == 99 { // c
-                            let fd = disconnect_writes.get(1).unwrap().as_raw_fd();
-                            unsafe { libc::write(fd, b"x".as_ptr() as *const _, 1); };
-                        } else if byt == 100 { // d
-                            let fd = disconnect_writes.get(2).unwrap().as_raw_fd();
-                            unsafe { libc::write(fd, b"x".as_ptr() as *const _, 1); };
-                        }
-                        i += 1;
-                    }
-                }
-            } else {
-                // POLLHUP / POLLERR / POLLNVAL — fd is gone
-                eprintln!("poll: unexpected revents: {:#x}", fds[0].revents);
-                return;
-            }
-        }
-    });
+    // Read disconnect requests written to /dev/hvc1 by the VM (bash logout)
+    spawn_disconnect_request(host_reads_disconnect_request, disconnect_writes);
 
     // Supervisor: waits for login actions, shuts down spawn_vm_io, then
     // hands the recovered hvc0 FDs to a socket proxy.
@@ -2001,7 +1993,7 @@ fn run_vm_daemon(
                 // Write a single newline to trigger the display of the login prompt
                 // as the original prompt has already been consumed
                 // unsafe { libc::write(vm_in.as_raw_fd(), "\n".as_ptr() as *const _, 1); }; // newline
-                spawn_console_socket_proxy(Arc::clone(&connect_clients),
+                spawn_console_socket_proxy(Arc::clone(&connected_clients),
                                            vm_out,
                                            vm_in,
                                            hvc0_disconnect_read,
