@@ -49,9 +49,9 @@ const BASH_LOGOUT_SCRIPT: &str = include_str!("bash_logout.sh");
 
 #[derive(Clone)]
 enum LoginAction {
-    Expect { text: String, timeout: Duration, },
+    Expect { text: String, timeout: Duration },
     Send(String),
-    Script { path: PathBuf, index: usize, },
+    Script { path: PathBuf, index: usize },
 }
 use LoginAction::*;
 
