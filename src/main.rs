@@ -271,10 +271,8 @@ fn attach_console(
     }
 
     for action in all_actions {
-        eprintln!("login action ...");
         match action {
             Expect { text, timeout } => {
-                eprintln!("login action expect ...");
                 let deadline = Instant::now() + timeout;
                 loop {
                     if let Some((_, rest)) = output_buf.split_once(text.as_str()) {
@@ -283,7 +281,6 @@ fn attach_console(
                     }
                     let now = Instant::now();
                     if now >= deadline {
-                        eprintln!("login action expect ... Timeout!");
                         return Err(format!("Timeout waiting for '{text}'").into());
                     }
                     poll_and_forward!(1);
@@ -302,8 +299,6 @@ fn attach_console(
             }
         }
     }
-
-    eprintln!("login actions done");
 
     // Interactive loop: bidirectional proxy using poll_with_wakeup in two threads.
     let (wakeup_read, wakeup_write) = create_pipe();
@@ -337,11 +332,9 @@ fn attach_console(
             loop {
                 match poll_with_wakeup(stream_fd, wakeup_read.as_raw_fd(), &mut buf) {
                     PollResult::Shutdown => {
-                        eprintln!("attach_console socket thread: PollResult::Shutdown");
                         break;
                     }
                     PollResult::Error => {
-                        eprintln!("attach_console socket thread: PollResult::Error");
                         break;
                     }
                     PollResult::Spurious => continue,
@@ -360,13 +353,20 @@ fn attach_console(
         }
     });
 
-    eprintln!("joining socket thread...!");
     socket_thread.join().ok();
-    eprintln!("socket_thread exited!");
     unsafe { libc::write(wakeup_write.as_raw_fd(), [0u8].as_ptr() as *const _, 1) };
     stdin_thread.join().ok();
 
     Ok(())
+}
+
+fn maybe_shutdown_vm(connected_clients: Arc<AtomicI32>, client_fd: RawFd, done_tx: Sender<Result<(), String>>) {
+    let num_clients = connected_clients.fetch_sub(1, Ordering::SeqCst) - 1;
+    if num_clients == 0 {
+        let msg = "VM shutting down...";
+        unsafe { libc::write(client_fd, msg.as_ptr() as *const _, msg.len()) };
+        let _ = done_tx.send(Ok(()));
+    }
 }
 
 fn spawn_console_socket_proxy(connected_clients: Arc<AtomicI32>,
@@ -391,6 +391,7 @@ fn spawn_console_socket_proxy(connected_clients: Arc<AtomicI32>,
         let _hvc_in = hvc_in;
 
         let disconnect_read_fd = disconnect_read.as_raw_fd();
+
         loop {
             // Blocking accept: wait for the next client.
             let (stream, _) = match listener.accept() {
@@ -403,7 +404,6 @@ fn spawn_console_socket_proxy(connected_clients: Arc<AtomicI32>,
             let client_fd = stream.as_raw_fd();
             let _stream = stream;
             let mut buf = [0u8; 4096];
-            let mut shutdown_wait: bool = false;
 
             'client: loop {
                 let mut fds = [
@@ -426,9 +426,7 @@ fn spawn_console_socket_proxy(connected_clients: Arc<AtomicI32>,
 
                 let ret = unsafe { libc::poll(fds.as_mut_ptr(), 3, -1) };
                 if ret < 0 {
-                    // client disconnected
-                    let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
-                    eprintln!("number of connected clients: {new_val}");
+                    maybe_shutdown_vm(Arc::clone(&connected_clients), client_fd, done_tx.clone());
                     break 'client;
                 }
 
@@ -438,34 +436,14 @@ fn spawn_console_socket_proxy(connected_clients: Arc<AtomicI32>,
                         unsafe { libc::read(hvc_out_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
                     if n <= 0 {
                         eprintln!("vm console gone");
+                        maybe_shutdown_vm(Arc::clone(&connected_clients), client_fd, done_tx.clone());
                         return; // VM console gone
                     }
-                    // Session-end sentinel written by the guest wrapper script after login
-                    // exits. Close the client socket so attach_console exits via normal
-                    // socket-close detection. OSC 9999 won't appear in real terminal output.
-                    // const SENTINEL: &[u8] = b"\x1b]9999\x07";
-                    // const SENTINEL_SHUTDOWN: &[u8] = b"\x1b]9998\x07";
-                    // const DSR: &[u8] = b"\x1b[6n";
-                    // if data.windows(SENTINEL.len()).any(|w| w == SENTINEL) {
-                        // means disconnect
-                        // let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
-                        // eprintln!("number of connected clients: {new_val}");
-                        // break 'client;
-                    // }
-                    // if data.windows(SENTINEL_SHUTDOWN.len()).any(|w| w == SENTINEL_SHUTDOWN) {
-                        // don't push more data to the client once we know that the VM is shutting down
-                        // shutdown_wait = true;
-                        // let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
-                        // eprintln!("number of connected clients: {new_val}");
-                    // }
-                    // Strip ESC[6n (DSR cursor-position query) — prevents spurious CPR
-                    // responses from leaking onto the client terminal.
                     if unsafe {
                         libc::write(client_fd, buf.as_ptr() as *const _, n as usize)
                     } < 0
                     {
-                        let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
-                        eprintln!("number of connected clients: {new_val}");
+                        maybe_shutdown_vm(Arc::clone(&connected_clients), client_fd, done_tx.clone());
                         break 'client; // client disconnected
                     }
                 }
@@ -473,15 +451,14 @@ fn spawn_console_socket_proxy(connected_clients: Arc<AtomicI32>,
                 if fds[1].revents & libc::POLLIN != 0 {
                     let n = unsafe { libc::read(client_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
                     if n <= 0 {
-                        let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
+                        maybe_shutdown_vm(Arc::clone(&connected_clients), client_fd, done_tx.clone());
                         break 'client; // client disconnected
                     }
                     if unsafe {
                         libc::write(hvc_in_fd, buf.as_ptr() as *const _, n as usize)
                     } < 0
                     {
-                        let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
-                        eprintln!("number of connected clients: {new_val}");
+                        maybe_shutdown_vm(Arc::clone(&connected_clients), client_fd, done_tx.clone());
                         return; // VM console gone
                     }
                 }
@@ -489,30 +466,13 @@ fn spawn_console_socket_proxy(connected_clients: Arc<AtomicI32>,
                 if fds[2].revents & libc::POLLIN != 0 {
                     let n = unsafe { libc::read(disconnect_read_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
                     if n <= 0 {
-                        let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
+                        maybe_shutdown_vm(Arc::clone(&connected_clients), client_fd, done_tx.clone());
                         break 'client;
                     } else {
-                        let old_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
-                        if old_val == 1 {
-                            let msg = "VM shutting down...";
-                            eprintln!("VM shutting down");
-                            unsafe { libc::write(client_fd, msg.as_ptr() as *const _, msg.len()) };
-                            let _ = done_tx.send(Ok(()));
-                        }
+                        maybe_shutdown_vm(Arc::clone(&connected_clients), client_fd, done_tx.clone());
                         break 'client;
                     }
                 }
-
-                // if fds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-                //     let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
-                //     eprintln!("number of connected clients: {new_val}");
-                //     return;
-                // }
-                // if fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
-                //     let new_val = connected_clients.fetch_sub(1, Ordering::SeqCst);
-                //     eprintln!("number of connected clients: {new_val}");
-                //     break 'client;
-                // }
             }
         }
     });
@@ -1955,7 +1915,6 @@ fn run_vm(
             host_console_fds.into_iter().enumerate()
         {
             disconnect_writes.push(disconnect_write);
-            eprintln!("spawning");
             spawn_console_socket_proxy(
                 Arc::clone(&connect_clients),
                 host_read,
@@ -2012,20 +1971,16 @@ fn run_vm(
                                     while i < slice.len() {
                                         let byt = slice[i];
                                         if byt == 97 { // a
-                                            eprintln!("disconnected /dev/hvc0");
                                             unsafe { libc::write(hvc0_disconnect_write.as_raw_fd(), b"x".as_ptr() as *const _, 1); };
                                         } else if byt == 98 { // b
                                             let fd = disconnect_writes.get(0).unwrap().as_raw_fd();
                                             unsafe { libc::write(fd, b"x".as_ptr() as *const _, 1); };
-                                            eprintln!("disconnected /dev/hvc2");
                                         } else if byt == 99 { // c
                                             let fd = disconnect_writes.get(1).unwrap().as_raw_fd();
                                             unsafe { libc::write(fd, b"x".as_ptr() as *const _, 1); };
-                                            eprintln!("disconnected /dev/hvc4");
                                         } else if byt == 100 { // d
                                             let fd = disconnect_writes.get(2).unwrap().as_raw_fd();
                                             unsafe { libc::write(fd, b"x".as_ptr() as *const _, 1); };
-                                            eprintln!("disconnected /dev/hvc6");
                                         }
                                         i += 1;
                                     }
