@@ -212,7 +212,6 @@ fn attach_console(
     all_actions.extend(login_actions);
 
     let mut buf = [0u8; 4096];
-    // Seed with any bytes already read during the busy-check poll.
     let mut output_buf = String::new();
     let mut raw_guard: Option<RawModeGuard> = None;
 
@@ -646,13 +645,13 @@ fn run_daemon_vm(args: CliArgs, instance_dir: PathBuf) -> Result<(), Box<dyn std
     // login_actions.push(Send(S.to_string()));
 
     // temporarily disable automatic poweroff when logging out
-    login_actions.push(Send(" export VIBE_POWEROFF=false".to_string()));
+    // login_actions.push(Send(" export VIBE_POWEROFF=false".to_string()));
 
-    login_actions.push(Send(" exit".to_string()));
-    login_actions.push(Expect {
-        text: "login:".to_string(),
-        timeout: LOGIN_EXPECT_TIMEOUT,
-    });
+    // login_actions.push(Send(" exit".to_string()));
+    // login_actions.push(Expect {
+    //     text: "login:".to_string(),
+    //     timeout: LOGIN_EXPECT_TIMEOUT,
+    // });
 
     let instance_raw = instance_dir.join("instance.raw");
 
@@ -1707,6 +1706,7 @@ fn spawn_login_actions_thread(
                 }
             }
         }
+        eprintln!("login actions done!");
     })
 }
 
@@ -2060,7 +2060,7 @@ fn run_vm_provision(
     let (vm_reads_from, host_writes_to) = create_pipe(); // hvc0 host->guest
     let (we_read_from, vm_writes_to) = create_pipe(); // hvc0 host<-guest
     let (vm_reads_resize_from, host_write_resize_to) = create_pipe(); // hvc1 host->guest
-    let (host_reads_resize_from, vm_writes_resize_to) = create_pipe(); // hvc1 host<-guest
+    let (_host_reads_resize_from, vm_writes_resize_to) = create_pipe(); // hvc1 host<-guest
 
     let mut prepared_network_backend = prepare_network_backend();
     let config = create_vm_configuration(

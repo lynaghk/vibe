@@ -1,14 +1,6 @@
 cat > /root/.bash_logout <<EOF
 
-if [[ "\$VIBE_POWEROFF" == "false" ]]; then
-  :
-else
-  history -w
-fi
-
-if [[ "\$VIBE_POWEROFF" == "false" ]]; then
-  :
-elif [[ "/dev/hvc0" == "\$(tty)" ]]; then
+if [[ "/dev/hvc0" == "\$(tty)" ]]; then
   printf 'a' > /dev/hvc1
   sleep 0.1
 elif [[ "/dev/hvc2" == "\$(tty)" ]]; then
