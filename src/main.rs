@@ -646,11 +646,11 @@ fn main_daemon(args: CliArgs, instance_dir: PathBuf) -> Result<(), Box<dyn std::
         }
 
         directory_shares.push(
-            DirectoryShare::new(project_root, PathBuf::from("/root/").join(project_name), false)
+            DirectoryShare::new(project_root, PathBuf::from("/root/").join(project_name.clone()), false)
                 .expect("Project directory must exist"),
         );
 
-        for subfolder in [".venv", "node_modules"] {
+        for subfolder in [".venv", "node_modules", "target"] {
             if env::current_dir()?.join(subfolder).exists() {
                 // println!(r"creating mapping {}", subfolder);
                 fs::create_dir_all(env::current_dir()?.join(".vibe").join(subfolder))
@@ -658,7 +658,7 @@ fn main_daemon(args: CliArgs, instance_dir: PathBuf) -> Result<(), Box<dyn std::
                 directory_shares.push(
                     DirectoryShare::new(
                         env::current_dir()?.join(".vibe").join(subfolder),
-                        env::current_dir()?.join(subfolder),
+                        PathBuf::from("/root").join(project_name.clone()).join(subfolder),
                         false,
                     )
                         .expect("Project directory must exist"),
@@ -1970,8 +1970,12 @@ fn run_vm_daemon(
             _ => {
                 let (vm_out, vm_in, resize) = io_ctx.shutdown();
 
-                // TODO: if the vibe client attaching aborts _before_ actually logging in,
-                // we want to shutdown the VM.
+                // TODO: If the vibe client attaching aborts _before_ actually logging in,
+                // we want to shutdown the VM if no clients have connected after 3000 ms:
+                // thread::spawn(move || {
+                //     thread::sleep(Duration::from_millis(3000));
+                //     connected_clients.deref()
+                // });
 
                 // Write a single newline to trigger the display of the login prompt
                 // as the original prompt has already been consumed
