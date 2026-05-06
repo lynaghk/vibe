@@ -20,7 +20,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use std::process::Child;
 use std::sync::atomic::{AtomicI32, Ordering};
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
@@ -857,13 +856,9 @@ Options
     if !args.daemon {
         // We are the initial client.
         let hvc0_sock = instance_dir.join("hvc0.sock");
-        if !args.attach {
-            // Sanity check that no VM is running:
-            if hvc0_sock.exists() {
-                return Err("hvc0.sock exists".into()); // TODO this can happen on unclean shutdown
-            }
+        if hvc0_sock.exists() {
+            let _ = fs::remove_file(hvc0_sock.clone())?;
         }
-
         // Provision the VM if needed.
         provision_vm(args, project_root.join(".vibe"))?;
 
@@ -876,28 +871,23 @@ Options
         // The instance-lock file descriptor was opened without O_CLOEXEC, so the
         // daemon inherits it across the exec call and holds the lock for its entire
         // lifetime — preventing a second `vibe` from starting a second VM.
-        let mut child: Option<Child> = None;
-        if !parse_cli()?.attach {
-            child = Some(Command::new(env::current_exe()?)
-                .arg("--_daemon")
-                .args(env::args_os().skip(1))
-                // .stdin(Stdio::null())
-                // .stdout(log_file.try_clone()?)
-                // .stderr(log_file)
-                .spawn()?);
-        }
+        let mut child = Command::new(env::current_exe()?)
+            .arg("--_daemon")
+            .args(env::args_os().skip(1))
+            // .stdin(Stdio::null())
+            // .stdout(log_file.try_clone()?)
+            // .stderr(log_file)
+            .spawn()?;
 
         let deadline = Instant::now() + Duration::from_secs(300); // 5 minute timeout
         // TODO don't spin?
         while !hvc0_sock.exists() {
-            if let Some(c) = &mut child {
-                match c.try_wait() {
-                    Ok(Some(status)) => {
-                        return Err(format!("Daemon exited with {status}").into());
-                    }
-                    Ok(None) => { /* still running */ }
-                    Err(e) => { return Err(e.into()); }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    return Err(format!("Daemon exited with {status}").into());
                 }
+                Ok(None) => { /* still running */ }
+                Err(e) => { return Err(e.into()); }
             }
             if Instant::now() >= deadline {
                 return Err("client: Timed out waiting for VM daemon to finish booting".into());
@@ -919,7 +909,6 @@ struct CliArgs {
     version: bool,
     help: bool,
     daemon: bool,
-    attach: bool,
     clear: bool,
     no_default_mounts: bool,
     mounts: Vec<String>,
@@ -942,7 +931,6 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
     let mut help = false;
     let mut daemon = false;
     let mut clear = true;
-    let mut attach = false;
     let mut no_default_mounts = false;
     let mut mounts = Vec::new();
     let mut login_actions = Vec::new();
@@ -956,7 +944,6 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
             Long("version") => version = true,
             Long("help") | Short('h') => help = true,
             Long("_daemon") => daemon = true,
-            Long("_attach") => attach = true,
             Long("no-clear") => clear = false,
             Long("no-default-mounts") => no_default_mounts = true,
             Long("cpus") => {
@@ -1013,7 +1000,6 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
         version,
         help,
         daemon,
-        attach,
         clear,
         no_default_mounts,
         mounts,
