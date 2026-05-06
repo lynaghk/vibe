@@ -650,7 +650,7 @@ fn main_daemon(args: CliArgs, instance_dir: PathBuf) -> Result<(), Box<dyn std::
                 .expect("Project directory must exist"),
         );
 
-        for subfolder in [".venv", "node_modules", "target"] {
+        for subfolder in [".venv", "node_modules", "target", ".cpcache"] {
             if env::current_dir()?.join(subfolder).exists() {
                 // println!(r"creating mapping {}", subfolder);
                 fs::create_dir_all(env::current_dir()?.join(".vibe").join(subfolder))
