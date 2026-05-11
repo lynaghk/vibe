@@ -15,6 +15,7 @@ apt-get install -y --no-install-recommends      \
         curl                                    \
         git                                     \
         tmux                                    \
+        sysstat                                 \
         ripgrep
 
 
