@@ -702,7 +702,7 @@ fn main_daemon(args: CliArgs, instance_dir: PathBuf) -> Result<(), Box<dyn std::
     // Enable bash history
     // login_actions.push(Send(" export HISTFILE=/root/.bash_history".to_string()));
 
-    if let Some(motd_action) = create_motd(&directory_shares) {
+    if let Some(motd_action) = create_motd(args.clone(), &directory_shares) {
         login_actions.push(motd_action);
     }
 
@@ -788,7 +788,7 @@ fn provision_vm(args: CliArgs, instance_dir: PathBuf) -> Result<(), Box<dyn std:
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     ensure_signed();
 
-    let args = parse_cli()?;
+    let args = parse_cli(false)?;
 
     if args.version {
         println!("Vibe");
@@ -845,6 +845,7 @@ Options
         {
             None => {
                 // eprintln!("VM is running / lock is held...");
+                parse_cli(true)?;
                 return attach_console(project_root, args.login_actions, args.clear)
             },
             Some(fd) => Some(fd),
@@ -854,6 +855,7 @@ Options
     };
 
     if !args.daemon {
+        parse_cli(true)?;
         // We are the initial client.
         let hvc0_sock = instance_dir.join("hvc0.sock");
         if hvc0_sock.exists() {
@@ -894,7 +896,7 @@ Options
             }
             thread::sleep(Duration::from_millis(10));
         }
-        attach_console(project_root, parse_cli()?.login_actions, parse_cli()?.clear)
+        attach_console(project_root, parse_cli(true)?.login_actions, parse_cli(true)?.clear)
     } else {
         // We are the daemon process.
         // At this point the VM is provisioned. The VM is now powered off.
@@ -904,6 +906,7 @@ Options
     }
 }
 
+#[derive(Clone)]
 struct CliArgs {
     disk: Option<PathBuf>,
     version: bool,
@@ -918,7 +921,7 @@ struct CliArgs {
     ram_bytes: u64,
 }
 
-fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
+fn parse_cli(attach: bool) -> Result<CliArgs, Box<dyn std::error::Error>> {
     fn os_to_string(value: OsString, flag: &str) -> Result<String, Box<dyn std::error::Error>> {
         value
             .into_string()
@@ -945,8 +948,16 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
             Long("help") | Short('h') => help = true,
             Long("_daemon") => daemon = true,
             Long("no-clear") => clear = false,
-            Long("no-default-mounts") => no_default_mounts = true,
+            Long("no-default-mounts") => {
+                if attach {
+                    return Err("Cannot specify --no-default-mounts when attaching to VM".into());
+                }
+                no_default_mounts = true
+            },
             Long("cpus") => {
+                if attach {
+                    return Err("Cannot specify --cpus when attaching to VM".into());
+                }
                 let value = os_to_string(parser.value()?, "--cpus")?.parse()?;
                 if value == 0 {
                     return Err("--cpus must be >= 1".into());
@@ -954,6 +965,9 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
                 cpu_count = value;
             }
             Long("ram") => {
+                if attach {
+                    return Err("Cannot specify --ram when attaching to VM".into());
+                }
                 let value: u64 = os_to_string(parser.value()?, "--ram")?.parse()?;
                 if value == 0 {
                     return Err("--ram must be >= 1".into());
@@ -961,9 +975,15 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
                 ram_bytes = value * BYTES_PER_MB;
             }
             Long("mount") => {
+                if attach {
+                    return Err("Cannot specify --mount when attaching to VM".into());
+                }
                 mounts.push(os_to_string(parser.value()?, "--mount")?);
             }
             Long("network") => {
+                if attach {
+                    return Err("Cannot specify --network when attaching to VM".into());
+                }
                 let value = os_to_string(parser.value()?, "--network")?;
                 network_mode = NetworkMode::parse(&value);
             }
@@ -986,6 +1006,9 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
                 login_actions.push(Expect { text, timeout });
             }
             Value(value) => {
+                if attach {
+                    return Err("Cannot specify disk path when attaching to VM".into());
+                }
                 if disk.is_some() {
                     return Err("Only one disk path may be provided".into());
                 }
@@ -1038,7 +1061,7 @@ fn script_command_from_content(
     Ok(command)
 }
 
-fn create_motd(directory_shares: &[DirectoryShare]) -> Option<LoginAction> {
+fn create_motd(args: CliArgs, directory_shares: &[DirectoryShare]) -> Option<LoginAction> {
     if directory_shares.is_empty() {
         return Some(Send(" clear".into()));
     }
@@ -1076,9 +1099,16 @@ fn create_motd(directory_shares: &[DirectoryShare]) -> Option<LoginAction> {
   ░▒▓█▓▓█▓▒░ ░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░        
   ░▒▓█▓▓█▓▒░ ░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░        
    ░▒▓██▓▒░  ░▒▓█▓▒░▒▓███████▓▒░░▒▓████████▓▒░
-
 ",
     );
+    output.push_str(&format!("{} ", args.cpu_count));
+    if args.cpu_count == 1 {
+        output.push_str("CPU");
+    } else {
+        output.push_str("CPUs");
+    };
+    output.push_str(&format!(", {} MB RAM\n\n", args.ram_bytes / BYTES_PER_MB));
+
     output.push_str(&format!(
         "{host_header:<host_width$}  {guest_header:<guest_width$}  {mode_header}\n",
         host_width = host_width
