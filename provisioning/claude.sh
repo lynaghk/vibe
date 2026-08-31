@@ -5,7 +5,7 @@ set -euxo pipefail
 # Set this env var so claude doesn't complain about running as root.
 echo "export IS_SANDBOX=1" >> .bashrc
 
-tool='    "npm:@anthropic-ai/claude-code" = { version = "latest", npm_args = "--ignore-scripts=false" }'
+tool='    claude = "latest"'
 echo "$tool" >> .config/mise/config.toml
 
 mise install
