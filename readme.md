@@ -130,7 +130,7 @@ Options:
                                                             `nat` uses Vibe's bundled user-mode network stack.
                                                             `vznat` uses Apple's VZNATNetworkDeviceAttachment.
   --cpus COUNT                                              Number of virtual CPUs (default 2).
-  --ram MEGABYTES                                           RAM size in megabytes (default 2048).
+  --ram SIZE                                                RAM size (default 2G).
 
 Login actions (executed in order after root login, repeatable):
 
@@ -145,7 +145,7 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
   --image NAME                                              Name for new image (default `default`).
   --replace                                                 Replace existing image with NAME, if one exists.
   --cpus COUNT                                              Number of virtual CPUs for the provisioning VM (default 2).
-  --ram MEGABYTES                                           RAM size in megabytes for the provisioning VM (default 2048).
+  --ram SIZE                                                RAM size for the provisioning VM (default 2G).
 ```
 
 ## Other notes

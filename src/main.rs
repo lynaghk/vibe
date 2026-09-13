@@ -69,6 +69,27 @@ struct DirectoryShare {
     read_only: bool,
 }
 
+fn parse_size(value: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let split_at = value
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (number, suffix) = value.split_at(split_at);
+    let number: u64 = number
+        .parse()
+        .map_err(|_| format!("Invalid size: {value}"))?;
+    let multiplier = match suffix.to_ascii_uppercase().as_str() {
+        "K" | "KB" => 1024,
+        "" | "M" | "MB" => 1024_u64.pow(2),
+        "G" | "GB" => 1024_u64.pow(3),
+        "T" | "TB" => 1024_u64.pow(4),
+        _ => return Err(format!("Invalid size: {value}; expected e.g. 100G").into()),
+    };
+    number
+        .checked_mul(multiplier)
+        .filter(|size| *size > 0)
+        .ok_or_else(|| format!("Invalid size: {value}").into())
+}
+
 impl DirectoryShare {
     fn new(
         host: PathBuf,
@@ -174,7 +195,7 @@ Options:
                                                             `nat` uses Vibe's bundled user-mode network stack.
                                                             `vznat` uses Apple's VZNATNetworkDeviceAttachment.
   --cpus COUNT                                              Number of virtual CPUs (default 2).
-  --ram MEGABYTES                                           RAM size in megabytes (default 2048).
+  --ram SIZE                                                RAM size (default 2G).
 
 Login actions (executed in order after root login, repeatable):
 
@@ -189,7 +210,7 @@ Provisioning creates a new named image by running (built-in) scripts. Options:
   --image NAME                                              Name for new image (default `default`).
   --replace                                                 Replace existing image with NAME, if one exists.
   --cpus COUNT                                              Number of virtual CPUs for the provisioning VM (default 2).
-  --ram MEGABYTES                                           RAM size in megabytes for the provisioning VM (default 2048).
+  --ram SIZE                                                RAM size for the provisioning VM (default 2G).
 
 {}",
                  provisioning_scripts_banner()
@@ -423,11 +444,7 @@ fn parse_cli() -> Result<CliArgs, Box<dyn std::error::Error>> {
     fn parse_ram_size(
         parser: &mut lexopt::Parser,
     ) -> Result<u64, Box<dyn std::error::Error + 'static>> {
-        let value: u64 = os_to_string(parser.value()?, "--ram")?.parse()?;
-        if value == 0 {
-            return Err("--ram must be >= 1".into());
-        }
-        Ok(value * BYTES_PER_MB)
+        parse_size(&os_to_string(parser.value()?, "--ram")?)
     }
 
     fn parse_cpu_count(
